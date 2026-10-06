@@ -10,18 +10,22 @@
 # Report: ~/sd-verify/report.txt. Models are cached in ~/sd-verify-cache.
 #
 #   curl -fsSL https://github.com/@REPO@/releases/download/@TAG@/verify-spark.sh | bash -s -- [--video] [--quick] [--skip-cpu]
+#
+# --archives DIR checks archives already on disk (e.g. a CI run's artifacts) instead of the release.
 set -uo pipefail
 
 TAG="@TAG@"
 REPO="@REPO@"
-VIDEO=0 QUICK=0 SKIP_CPU=0
-for arg in "$@"; do
-  case "$arg" in
+VIDEO=0 QUICK=0 SKIP_CPU=0 ARCHIVES=
+while [ $# -gt 0 ]; do
+  case "$1" in
     --video) VIDEO=1 ;;
     --quick) QUICK=1 ;;
     --skip-cpu) SKIP_CPU=1 ;;
-    *) echo "unknown option $arg"; exit 2 ;;
+    --archives) ARCHIVES="$(cd "$2" && pwd)"; shift ;;
+    *) echo "unknown option $1"; exit 2 ;;
   esac
+  shift
 done
 
 SHORT="${TAG##*-}"
@@ -83,7 +87,14 @@ fi
 # --- 2. archives -----------------------------------------------------------------------------------
 section "Archives"
 BASE="https://github.com/$REPO/releases/download/$TAG"
-fetch "$BASE/SHA256SUMS" "$CACHE/SHA256SUMS-$TAG" || exit 1
+if [ -n "$ARCHIVES" ]; then
+  # Local archives: copy them where fetch() finds them and checksum what is there.
+  find "$ARCHIVES" -name "sd-master-$SHORT-bin-Linux-*.zip" -exec cp {} "$CACHE/" \;
+  (cd "$CACHE" && sha256sum sd-master-"$SHORT"-bin-Linux-*.zip) > "$CACHE/SHA256SUMS-$TAG"
+  say "archives from $ARCHIVES (not the release)"
+else
+  fetch "$BASE/SHA256SUMS" "$CACHE/SHA256SUMS-$TAG" || exit 1
+fi
 declare -A TREE
 for variant in cuda13 cpu; do
   if [ "$variant" = cuda13 ]; then suffix=-cuda13; else suffix=; fi

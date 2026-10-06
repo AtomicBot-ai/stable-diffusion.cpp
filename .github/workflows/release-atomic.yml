@@ -946,12 +946,15 @@ jobs:
         with:
           path: ~/sd-smoke-model
           key: sd-smoke-${{ runner.os }}-${{ env.SMOKE_MODEL_SHA256 }}
+      # The runner's GPU is an "Apple Paravirtual device" (MTLGPUFamilyApple5, no simdgroup
+      # reduction): ggml's Metal kernels crash on it, and upstream's own build does the same. Metal
+      # is checked on real Apple Silicon; here the archive, its loader and sd-server run on the CPU.
       - name: Smoke
         run: |
           python3 atomic/ci/smoke.py --dir "$RUNNER_TEMP/sd" \
             --model "$HOME/sd-smoke-model/sd_turbo-f16-q8_0.gguf" \
             --model-url "$SMOKE_MODEL_URL" --model-sha256 "$SMOKE_MODEL_SHA256" \
-            --out "$RUNNER_TEMP/smoke.png"
+            --backend cpu --out "$RUNNER_TEMP/smoke.png"
       - if: always()
         uses: actions/upload-artifact@v4
         with:

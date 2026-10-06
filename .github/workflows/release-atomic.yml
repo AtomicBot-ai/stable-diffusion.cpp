@@ -502,12 +502,13 @@ jobs:
         run: |
           $common = @('-DGGML_NATIVE=OFF', '-DSD_BUILD_SHARED_LIBS=ON', '-DSD_BUILD_SHARED_GGML_LIB=ON',
                       '-DGGML_BACKEND_DL=ON', '-DGGML_CPU_ALL_VARIANTS=ON')
-          $extra = switch ($env:VARIANT) {
-            'cpu'    { @() }
-            'vulkan' { @('-DSD_VULKAN=ON') }
-            'cuda12' { @('-DSD_CUDA=ON', "-DCMAKE_CUDA_ARCHITECTURES=$env:CUDA_ARCHS_WIN_CUDA12") }
-            'cuda13' { @('-DSD_CUDA=ON', "-DCMAKE_CUDA_ARCHITECTURES=$env:CUDA_ARCHS_WIN_CUDA13_X64", '-DCMAKE_CUDA_FLAGS=-compress-mode=size') }
-          }
+          # @(...): a one-element result would otherwise unroll to a string, and splatting a string
+          # passes it character by character.
+          $extra = @(switch ($env:VARIANT) {
+            'vulkan' { '-DSD_VULKAN=ON' }
+            'cuda12' { '-DSD_CUDA=ON', "-DCMAKE_CUDA_ARCHITECTURES=$env:CUDA_ARCHS_WIN_CUDA12" }
+            'cuda13' { '-DSD_CUDA=ON', "-DCMAKE_CUDA_ARCHITECTURES=$env:CUDA_ARCHS_WIN_CUDA13_X64", '-DCMAKE_CUDA_FLAGS=-compress-mode=size' }
+          })
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=cl.exe -DCMAKE_CXX_COMPILER=cl.exe `
             '-DCMAKE_CXX_FLAGS=/bigobj' -DCMAKE_POLICY_DEFAULT_CMP0091=NEW -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL `
             @common @extra

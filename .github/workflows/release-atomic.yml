@@ -173,6 +173,12 @@ jobs:
           sparse-checkout: atomic
       - name: Apply Atomic patches
         run: bash _atomic/atomic/ci/apply-patches.sh
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: release-atomic-macos-arm64
+          max-size: 1G
+          evict-old-files: job
       - uses: actions/setup-node@v4
         with:
           node-version: 20
@@ -183,7 +189,8 @@ jobs:
       # Upstream's flags: a universal binary whose x86_64 slice targets AVX2.
       - name: Build
         run: |
-          cmake -S . -B build -DGGML_AVX2=ON -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" -DSD_BUILD_SHARED_LIBS=ON
+          cmake -S . -B build -DGGML_AVX2=ON -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" -DSD_BUILD_SHARED_LIBS=ON \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
           cmake --build build --config Release -j "$(sysctl -n hw.ncpu)"
 
       - name: Package and verify
@@ -237,6 +244,12 @@ jobs:
           sparse-checkout: atomic
       - name: Apply Atomic patches
         run: bash _atomic/atomic/ci/apply-patches.sh
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: release-atomic-${{ matrix.id }}
+          max-size: ${{ matrix.cuda_ver != '' && '2G' || '1G' }}
+          evict-old-files: job
       - uses: actions/setup-node@v4
         with:
           node-version: 20
@@ -284,11 +297,13 @@ jobs:
             -DSD_BUILD_SHARED_LIBS=ON -DSD_BUILD_SHARED_GGML_LIB=ON
             -DGGML_NATIVE=OFF -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON
             -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON '-DCMAKE_INSTALL_RPATH=$ORIGIN'
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
           )
           case "$VARIANT" in
             vulkan) args+=(-DSD_VULKAN=ON) ;;
             cuda*)
-              args+=(-DSD_CUDA=ON "-DCMAKE_CUDA_ARCHITECTURES=${{ matrix.cuda_archs }}" -DCMAKE_CUDA_FLAGS=-compress-mode=size)
+              args+=(-DSD_CUDA=ON "-DCMAKE_CUDA_ARCHITECTURES=${{ matrix.cuda_archs }}" -DCMAKE_CUDA_FLAGS=-compress-mode=size
+                     -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache)
               if [ "${{ matrix.gcc }}" = 14 ]; then args+=(-DCMAKE_CUDA_HOST_COMPILER=g++-14); fi
               ;;
           esac
@@ -354,6 +369,12 @@ jobs:
           sparse-checkout: atomic
       - name: Apply Atomic patches
         run: bash _atomic/atomic/ci/apply-patches.sh
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: release-atomic-linux-rocm-x64
+          max-size: 2G
+          evict-old-files: job
 
       - name: Dependencies
         run: sudo apt-get install -y build-essential git cmake wget ninja-build zip file
@@ -405,8 +426,9 @@ jobs:
             -DSD_BUILD_SHARED_GGML_LIB=ON \
             -DGGML_BACKEND_DL=ON \
             -DGGML_CPU_ALL_VARIANTS=ON \
-            -DSD_BUILD_SHARED_LIBS=ON
-          cmake --build build --config Release
+            -DSD_BUILD_SHARED_LIBS=ON \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_HIP_COMPILER_LAUNCHER=ccache
+          cmake --build build --config Release -j "$(nproc)"
 
       - name: Package and verify
         run: |
@@ -457,6 +479,12 @@ jobs:
       - name: Apply Atomic patches
         shell: bash
         run: bash _atomic/atomic/ci/apply-patches.sh
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: release-atomic-${{ matrix.id }}
+          max-size: ${{ startsWith(matrix.variant, 'cuda') && '2G' || '1G' }}
+          evict-old-files: job
       - uses: actions/setup-node@v4
         with:
           node-version: 20
@@ -502,13 +530,14 @@ jobs:
         shell: pwsh
         run: |
           $common = @('-DGGML_NATIVE=OFF', '-DSD_BUILD_SHARED_LIBS=ON', '-DSD_BUILD_SHARED_GGML_LIB=ON',
-                      '-DGGML_BACKEND_DL=ON', '-DGGML_CPU_ALL_VARIANTS=ON')
+                      '-DGGML_BACKEND_DL=ON', '-DGGML_CPU_ALL_VARIANTS=ON',
+                      '-DCMAKE_C_COMPILER_LAUNCHER=ccache', '-DCMAKE_CXX_COMPILER_LAUNCHER=ccache')
           # @(...): a one-element result would otherwise unroll to a string, and splatting a string
           # passes it character by character.
           $extra = @(switch ($env:VARIANT) {
             'vulkan' { '-DSD_VULKAN=ON' }
-            'cuda12' { '-DSD_CUDA=ON', "-DCMAKE_CUDA_ARCHITECTURES=$env:CUDA_ARCHS_WIN_CUDA12" }
-            'cuda13' { '-DSD_CUDA=ON', "-DCMAKE_CUDA_ARCHITECTURES=$env:CUDA_ARCHS_WIN_CUDA13_X64", '-DCMAKE_CUDA_FLAGS=-compress-mode=size' }
+            'cuda12' { '-DSD_CUDA=ON', "-DCMAKE_CUDA_ARCHITECTURES=$env:CUDA_ARCHS_WIN_CUDA12", '-DCMAKE_CUDA_COMPILER_LAUNCHER=ccache' }
+            'cuda13' { '-DSD_CUDA=ON', "-DCMAKE_CUDA_ARCHITECTURES=$env:CUDA_ARCHS_WIN_CUDA13_X64", '-DCMAKE_CUDA_FLAGS=-compress-mode=size', '-DCMAKE_CUDA_COMPILER_LAUNCHER=ccache' }
           })
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=cl.exe -DCMAKE_CXX_COMPILER=cl.exe `
             '-DCMAKE_CXX_FLAGS=/bigobj' -DCMAKE_POLICY_DEFAULT_CMP0091=NEW -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL `
@@ -573,6 +602,12 @@ jobs:
       - name: Apply Atomic patches
         shell: bash
         run: bash _atomic/atomic/ci/apply-patches.sh
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: release-atomic-win-rocm-x64
+          max-size: 2G
+          evict-old-files: job
       - uses: actions/setup-node@v4
         with:
           node-version: 20
@@ -629,6 +664,7 @@ jobs:
             -DCMAKE_HIP_COMPILER="${env:HIP_PATH}\lib\llvm\bin\clang.exe" `
             -DHIP_PATH="${env:HIP_PATH}" `
             -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_HIP_COMPILER_LAUNCHER=ccache `
             -DGPU_TARGETS="${env:ROCM_TARGETS_WIN}"
           if ($LASTEXITCODE -ne 0) { throw "cmake configure failed" }
           cmake --build build --config Release --parallel ${env:NUMBER_OF_PROCESSORS}
@@ -678,6 +714,12 @@ jobs:
       - name: Apply Atomic patches
         shell: bash
         run: bash _atomic/atomic/ci/apply-patches.sh
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: release-atomic-win-cpu-arm64
+          max-size: 1G
+          evict-old-files: job
       - uses: actions/setup-node@v4
         with:
           node-version: 20
@@ -695,7 +737,8 @@ jobs:
             -DCMAKE_TOOLCHAIN_FILE=_atomic/atomic/cmake/arm64-windows-llvm.cmake ^
             -DGGML_NATIVE=OFF -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=OFF -DGGML_OPENMP=OFF ^
             -DSD_BUILD_SHARED_LIBS=ON -DSD_BUILD_SHARED_GGML_LIB=ON ^
-            -DCMAKE_POLICY_DEFAULT_CMP0091=NEW -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL || exit /b 1
+            -DCMAKE_POLICY_DEFAULT_CMP0091=NEW -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL ^
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache || exit /b 1
           cmake --build build -j %NUMBER_OF_PROCESSORS% || exit /b 1
 
       - name: Package
@@ -748,6 +791,12 @@ jobs:
       - name: Apply Atomic patches
         shell: bash
         run: bash _atomic/atomic/ci/apply-patches.sh
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: release-atomic-win-cuda13-arm64
+          max-size: 2G
+          evict-old-files: job
 
       - name: Install CUDA (x64 compiler, arm64 target libraries)
         shell: pwsh
@@ -766,6 +815,7 @@ jobs:
             -DSD_BUILD_SHARED_LIBS=ON -DSD_BUILD_SHARED_GGML_LIB=ON ^
             -DSD_BUILD_EXAMPLES=OFF -DSD_SERVER_BUILD_FRONTEND=OFF ^
             -DCMAKE_POLICY_DEFAULT_CMP0091=NEW -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL ^
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache ^
             "-DCMAKE_CUDA_ARCHITECTURES=90-virtual;121-real" || exit /b 1
           cmake --build build-cuda --target ggml-cuda -j %NUMBER_OF_PROCESSORS% || exit /b 1
 

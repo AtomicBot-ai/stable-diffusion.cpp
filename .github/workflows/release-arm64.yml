@@ -399,7 +399,7 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y "cuda-driver-dev-${{ env.LINUX_CUDA }}"
           mkdir -p "$RUNNER_TEMP/stub"
-          ln -s "$(find /usr/local/cuda-*/ -path '*stubs/libcuda.so' | head -1)" "$RUNNER_TEMP/stub/libcuda.so.1"
+          cp -L "$(find /usr/local/cuda-*/ -path '*stubs/libcuda.so' | head -1)" "$RUNNER_TEMP/stub/libcuda.so.1"
           echo "STUB_ARGS=--lib-dir $RUNNER_TEMP/stub" >> "$GITHUB_ENV"
 
       - name: Cache smoke model
@@ -408,12 +408,19 @@ jobs:
           path: ~/sd-smoke-model
           key: sd-smoke-${{ env.SMOKE_MODEL_SHA256 }}
 
-      - name: Smoke
+      # In a bare python:3.12-slim container, not on the runner: the runner has build tools and
+      # their runtimes (libgomp, ...) installed, a user's machine may not. A GB10 check caught
+      # exactly that: an archive that ran here and missed libgomp.so.1 on a clean Ubuntu.
+      - name: Smoke (bare container)
         run: |
-          python3 atomic/ci/smoke.py --dir "$RUNNER_TEMP/sd" \
-            --model ~/sd-smoke-model/sd_turbo-f16-q8_0.gguf \
-            --model-url "$SMOKE_MODEL_URL" --model-sha256 "$SMOKE_MODEL_SHA256" \
-            --out "$RUNNER_TEMP/smoke.png" ${STUB_ARGS:-}
+          mkdir -p "$HOME/sd-smoke-model"
+          docker run --rm --user "$(id -u):$(id -g)" -e GITHUB_ACTIONS \
+            -v "$RUNNER_TEMP:$RUNNER_TEMP" -v "$HOME/sd-smoke-model:$HOME/sd-smoke-model" \
+            -v "$PWD/atomic:/atomic:ro" python:3.12-slim \
+            python /atomic/ci/smoke.py --dir "$RUNNER_TEMP/sd" \
+              --model "$HOME/sd-smoke-model/sd_turbo-f16-q8_0.gguf" \
+              --model-url "$SMOKE_MODEL_URL" --model-sha256 "$SMOKE_MODEL_SHA256" \
+              --out "$RUNNER_TEMP/smoke.png" ${STUB_ARGS:-}
 
       - name: Upload smoke image
         if: always()

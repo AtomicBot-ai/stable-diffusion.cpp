@@ -1,37 +1,41 @@
-# Atomic arm64 builds of stable-diffusion.cpp
+# Atomic builds of stable-diffusion.cpp
 
-This fork exists to publish what [leejet/stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp)
-does not: release archives for **arm64 Linux** and **Windows on Arm**, with CUDA for NVIDIA's arm64 parts
-(DGX Spark / GB10 on Linux, RTX Spark / N1X laptops on Windows). They are consumed by
-[Atomic Chat](https://github.com/AtomicBot-ai/Atomic-Chat) through
-`atomic-chat-conf/backends/sdcpp-manifest.json`, mirrored beside upstream's own assets of the same tag.
+This fork builds **every** stable-diffusion.cpp engine [Atomic Chat](https://github.com/AtomicBot-ai/Atomic-Chat)
+ships, from an unmodified [leejet/stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) tag:
+
+- **upstream's nine archives, with upstream's flags:** `macos-arm64`; `win-cpu-x64`, `win-vulkan-x64`,
+  `win-cuda12-x64` (+ the `cudart-sd-bin-win-cu12-x64` companion) and `win-rocm-x64`; `linux-cpu-x64`,
+  `linux-vulkan-x64` and `linux-rocm-x64`;
+- **archives upstream does not publish:** `linux-cpu-arm64` and `linux-cuda13-arm64` (DGX Spark / GB10),
+  `win-cpu-arm64` and `win-cuda13-arm64` (RTX Spark / N1X), `linux-cuda12-x64`, and `win-cuda13-x64`.
+
+They are consumed through `atomic-chat-conf/backends/sdcpp-manifest.json`; the conf repo's
+`mirror-sdcpp.yml` re-signs the Windows and macOS ones with Atomic Chat's certificates.
 
 ## Branches
 
 | Branch   | What it is                                                                 |
 | -------- | -------------------------------------------------------------------------- |
 | `master` | A fast-forward mirror of upstream `master`. Never commit here.             |
-| `atomic` | The default branch: upstream `master` plus **only added files** (`atomic/`, `.github/workflows/release-arm64.yml`). |
+| `atomic` | The default branch: upstream `master` plus **only added files** (`atomic/`, `.github/workflows/release-atomic.yml`). |
 
 Source code is never changed on a branch. Every build starts from an **upstream tag** and applies the
-patch series in [`atomic/patches/`](patches/) (empty means the tag as is). That keeps rebasing trivial
-and makes the release notes say exactly what differs from upstream.
+patch series in [`atomic/patches/`](patches/). That keeps rebasing trivial and makes the release
+notes say exactly what differs from upstream.
 
 ## Building a release
 
-Actions → **Release arm64 (Atomic)** → `upstream_tag` = the tag Atomic Chat's manifest pins
-(e.g. `master-883-137f740`), `publish` = on. The run:
-
-| Job | Runner | Output |
-| --- | --- | --- |
-| `linux-cuda13-arm64` | `ubuntu-24.04-arm` | `sd-master-<sha7>-bin-Linux-Ubuntu-24.04-aarch64-cuda13.zip` |
-| `linux-cpu-arm64` | `ubuntu-24.04-arm` | `sd-master-<sha7>-bin-Linux-Ubuntu-24.04-aarch64.zip` |
-| `windows-arm64-cpu` | `windows-2022` (cross) | `sd-master-<sha7>-bin-win-cpu-arm64.zip` |
-| `windows-arm64-cuda13` | `windows-2022` (cross) | `sd-master-<sha7>-bin-win-cuda13-arm64.zip` |
-| `smoke-*` | `ubuntu-24.04-arm`, `windows-11-arm` | every archive starts, lists devices, generates an image over HTTP |
-| `release` | | the release of `<upstream_tag>` here, with `SHA256SUMS` and the verify scripts |
+Actions → **Release (Atomic)**:
+- `upstream_tag`: the tag Atomic Chat's manifest pins, e.g. `master-883-137f740`;
+- `targets`: `all`, or a comma-separated list of backend ids to rebuild while fixing one;
+- `publish`: creates the release of the tag here, and needs `all`.
 
 Then run `mirror-sdcpp.yml` in atomic-chat-conf for the same tag.
+
+Every archive except ROCm is smoke-tested on a machine without a GPU: it must start, list its devices,
+and generate an image through sd-server's HTTP API. On Linux this runs in a bare `python:3.12-slim`
+container, so a missing runtime library fails CI. ROCm gets build and structure checks only, since no
+runner has the AMD driver, which is also the case upstream.
 
 ### Choices that are easy to get wrong
 

@@ -7,7 +7,8 @@
 #   - each versioned soname (libggml.so.0, ...) only where an ELF in the tree needs it;
 #   - the CUDA runtime sonames libggml-cuda.so needs, copied from the toolkit;
 #   - any other system library a needed soname resolves to (libgomp for OpenMP), because a bare
-#     distro or container does not have it. Only BASE_SONAMES stay outside the archive.
+#     distro or container does not have it. Only BASE_SONAMES stay outside the archive, plus
+#     whatever lives in EXTERNAL_DIRS (colon-separated; the ROCm runtime, which users install).
 # Symlinks are dereferenced because Atomic Chat's unzip writes a link out as a plain file.
 # Fails if an ELF in the tree needs a soname that is neither inside it nor in BASE_SONAMES.
 set -euo pipefail
@@ -22,23 +23,35 @@ mkdir -p "$out"
 for f in "$bin"/*; do
   name="$(basename "$f")"
   case "$name" in *.so.*) continue ;; esac
-  [ -f "$f" ] && cp -L "$f" "$out/$name"
+  if [ -d "$f" ]; then
+    cp -RL "$f" "$out/$name"
+  elif [ -f "$f" ]; then
+    cp -L "$f" "$out/$name"
+  fi
 done
 
 cuda_libs=()
 if [ -n "$cuda_home" ]; then
-  for d in "$cuda_home/targets/sbsa-linux/lib" "$cuda_home/lib64"; do
+  for d in "$cuda_home/targets/sbsa-linux/lib" "$cuda_home/targets/x86_64-linux/lib" "$cuda_home/lib64"; do
     [ -d "$d" ] && cuda_libs+=("$d")
   done
 fi
 
-# Present on every glibc distro (and libcuda.so.1 comes with the NVIDIA driver).
-BASE_SONAMES=" linux-vdso.so.1 libc.so.6 libm.so.6 libdl.so.2 libpthread.so.0 librt.so.1 ld-linux-aarch64.so.1 ld-linux-x86-64.so.2 libstdc++.so.6 libgcc_s.so.1 libcuda.so.1 "
-is_base() { case "$BASE_SONAMES" in *" $1 "*) return 0 ;; esac; return 1; }
+# Present on every glibc distro; libcuda.so.1 comes with the NVIDIA driver and libvulkan.so.1 is
+# the system Vulkan loader the GPU drivers register with.
+BASE_SONAMES=" linux-vdso.so.1 libc.so.6 libm.so.6 libdl.so.2 libpthread.so.0 librt.so.1 ld-linux-aarch64.so.1 ld-linux-x86-64.so.2 libstdc++.so.6 libgcc_s.so.1 libcuda.so.1 libvulkan.so.1 "
+is_external() {
+  local d
+  IFS=: read -r -a dirs <<< "${EXTERNAL_DIRS:-}"
+  for d in "${dirs[@]}"; do [ -n "$d" ] && [ -e "$d/$1" ] && return 0; done
+  return 1
+}
+is_base() { case "$BASE_SONAMES" in *" $1 "*) return 0 ;; esac; is_external "$1"; }
 system_path() { /sbin/ldconfig -p | awk -v s="$1" '$1 == s { print $NF; exit }'; }
 
 needed() {
   for e in "$out"/*; do
+    [ -f "$e" ] || continue
     readelf -d "$e" 2>/dev/null | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p'
   done | sort -u
 }

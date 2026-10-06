@@ -1,25 +1,27 @@
-# Install the CUDA pieces that cross-compile ggml-cuda for Windows on Arm on an x64 host:
-# the compiler side (nvcc, crt, nvvm, cccl, cuobjdump) for windows-x86_64 and the libraries
-# ggml-cuda links and ships (cudart, cublas) for windows-arm64. Versions and checksums come from
-# NVIDIA's redist manifest, so moving to a newer CUDA is a one-line change of -Version.
-# Mirrors llama.cpp's .github/actions/windows-setup-cuda (13.4, arm64).
+# Install a Windows CUDA toolkit from NVIDIA's redist archives: the compiler side (nvcc, crt, nvvm,
+# cccl, cuobjdump) always for the x64 host, and the libraries ggml-cuda links and ships (cudart,
+# cublas) for -TargetArch. arm64 is a cross build (Windows on Arm, CUDA 13.4+); x64 is native.
+# Versions and checksums come from the redist manifest, so moving to a newer CUDA is a one-line
+# change of -Version. Mirrors llama.cpp's .github/actions/windows-setup-cuda.
 param(
   [Parameter(Mandatory)][string]$Version,
-  [Parameter(Mandatory)][string]$Root
+  [Parameter(Mandatory)][string]$Root,
+  [ValidateSet('arm64', 'x64')][string]$TargetArch = 'arm64'
 )
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
 $base = 'https://developer.download.nvidia.com/compute/cuda/redist'
 $manifest = Invoke-RestMethod "$base/redistrib_$Version.json"
+$libPlatform = if ($TargetArch -eq 'arm64') { 'windows-arm64' } else { 'windows-x86_64' }
 $parts = [ordered]@{
   cuda_nvcc      = 'windows-x86_64'
   cuda_crt       = 'windows-x86_64'
   libnvvm        = 'windows-x86_64'
   cccl           = 'windows-x86_64'
   cuda_cuobjdump = 'windows-x86_64'
-  cuda_cudart    = 'windows-arm64'
-  libcublas      = 'windows-arm64'
+  cuda_cudart    = $libPlatform
+  libcublas      = $libPlatform
 }
 
 New-Item -ItemType Directory -Force $Root | Out-Null
@@ -46,8 +48,9 @@ Write-Host "--- import libraries"
 Get-ChildItem "$Root\lib" -Recurse -Filter *.lib | ForEach-Object { $_.FullName.Substring($Root.Length) }
 Write-Host "--- runtime DLLs"
 Get-ChildItem "$Root\bin" -Recurse -Filter *.dll | ForEach-Object { $_.FullName.Substring($Root.Length) }
+$libDir = if ($TargetArch -eq 'arm64') { 'arm64' } else { 'x64' }
 foreach ($lib in 'cudart.lib', 'cublas.lib', 'cublasLt.lib', 'cuda.lib') {
-  if (-not (Test-Path "$Root\lib\arm64\$lib")) { throw "lib\arm64\$lib missing; the msvc-cuda toolchain expects it there" }
+  if (-not (Test-Path "$Root\lib\$libDir\$lib")) { throw "lib\$libDir\$lib missing" }
 }
 # robocopy leaves 1 ("files copied") behind, which a pwsh step would report as a failure.
 exit 0

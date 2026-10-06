@@ -1,0 +1,24 @@
+Export libwebm symbols when building with clang for Windows.
+
+Why: the Windows-on-Arm build uses clang targeting arm64-pc-windows-msvc (ggml-cpu
+rejects MSVC on ARM). With SD_BUILD_SHARED_GGML_LIB, libwebm becomes webm.dll, and
+libwebm enables CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS only `if(MSVC)`, which clang does not
+set; the DLL exports nothing and sd-cli/sd-server fail to link (undefined mkvmuxer::*).
+No effect on MSVC or non-Windows builds. Worth offering upstream.
+
+diff --git a/thirdparty/CMakeLists.txt b/thirdparty/CMakeLists.txt
+index 84f0fce..834698d 100644
+--- a/thirdparty/CMakeLists.txt
++++ b/thirdparty/CMakeLists.txt
+@@ -106,4 +106,11 @@ if(SD_WEBM AND NOT SD_USE_SYSTEM_WEBM)
+     target_compile_features(webm PRIVATE cxx_std_17)
+ 
+     target_include_directories(webm INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/libwebm)
++
++    # libwebm turns on CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS only when MSVC is set, which a
++    # clang build targeting *-windows-msvc does not set; as a DLL it would then export
++    # nothing and sd-cli/sd-server fail to link against mkvmuxer.
++    if(WIN32 AND BUILD_SHARED_LIBS)
++        set_target_properties(webm PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
++    endif()
+ endif()

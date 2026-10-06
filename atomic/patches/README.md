@@ -5,4 +5,8 @@ order. Name them `NNNN-short-description.patch`; prefix with `ggml--` for a patc
 (applied with `git -C ggml apply`). Keep each patch small, explain why in its header, and offer it
 upstream: a patch that lands upstream is deleted here on the next tag.
 
-None yet: the published archives are built from the upstream tag as is.
+Current series (build system only; no source code differs from the upstream tag):
+
+| Patch | Why |
+| --- | --- |
+| `0001-export-libwebm-symbols-for-clang-on-windows.patch` | clang for Windows does not set `MSVC`, so libwebm's DLL exported nothing and `sd-cli`/`sd-server` failed to link. |

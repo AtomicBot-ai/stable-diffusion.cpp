@@ -192,7 +192,8 @@ jobs:
           cp ggml/LICENSE build/bin/ggml.txt
           cp LICENSE build/bin/stable-diffusion.cpp.txt
           for f in sd-cli sd-server; do lipo -archs "build/bin/$f" | tee /dev/stderr | grep -q arm64; done
-          bad="$(for f in build/bin/sd-cli build/bin/sd-server build/bin/*.dylib; do otool -L "$f" | tail -n +2 | awk '{print $1}'; done \
+          # otool prints a "<file> (architecture ...):" header per slice of a universal binary.
+          bad="$(for f in build/bin/sd-cli build/bin/sd-server build/bin/*.dylib; do otool -L "$f" | grep -v ':$' | awk '{print $1}'; done \
             | grep -v -E '^(/usr/lib/|/System/Library/|@rpath/|@loader_path/|@executable_path/)' | sort -u || true)"
           if [ -n "$bad" ]; then echo "$bad"; echo "::error::links outside the archive and the OS"; exit 1; fi
           asset="sd-master-$SHORT-bin-Darwin-macOS-$(sw_vers -productVersion)-arm64.zip"

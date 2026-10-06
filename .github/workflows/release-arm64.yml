@@ -1,0 +1,568 @@
+name: Release arm64 (Atomic)
+
+# Builds stable-diffusion.cpp for the arm64 hosts upstream publishes no archive for, from an
+# unmodified upstream tag plus the patch series in atomic/patches (empty = upstream source as is):
+#
+#   linux-cuda13-arm64  DGX Spark / GB10 and other SBSA machines   CUDA 13.0, sm_121 SASS + PTX 90
+#   linux-cpu-arm64     arm64 Linux without NVIDIA
+#   win-cuda13-arm64    RTX Spark / N1X laptops                    CUDA 13.4, sm_121 SASS + PTX 90
+#   win-cpu-arm64       Windows on Arm without NVIDIA
+#
+# Asset names follow upstream's (sd-master-<sha7>-bin-...), so atomic-chat-conf's mirror-sdcpp.yml
+# matches them beside upstream's own assets of the same tag. The release here carries the upstream
+# tag name. See atomic/README.md.
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: "leejet/stable-diffusion.cpp release tag to build (e.g. master-883-137f740)"
+        required: true
+        type: string
+      publish:
+        description: "Create or update the release of that tag in this repository"
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: release-arm64-${{ inputs.upstream_tag }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_REPO: leejet/stable-diffusion.cpp
+  TAG: ${{ inputs.upstream_tag }}
+  # sm_121 SASS for GB10 / N1X; a Hopper PTX floor so GH200 (90), GB200 (100) and Thor (110) JIT
+  # instead of failing. ggml rewrites 121 to the arch-specific 121a itself.
+  CUDA_ARCHS: "90-virtual;121-real"
+  # The toolkit upstream's `-spark` image is built with; needs only the r580 driver DGX OS ships.
+  LINUX_CUDA: "13-0"
+  # First CUDA with Windows on Arm (CUDA 13.4, 2026-09-09); resolved from NVIDIA's redist manifest.
+  WIN_CUDA_REDIST: "13.4.2"
+  PNPM_VERSION: "10.15.1"
+  VS_VCVARS: C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat
+  SMOKE_MODEL_URL: https://huggingface.co/Green-Sky/SD-Turbo-GGUF/resolve/main/sd_turbo-f16-q8_0.gguf
+  SMOKE_MODEL_SHA256: d50be7655f0a554cf8041c145d88b210bd5f3c545423119dee62ae08cae51580
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      short: ${{ steps.tag.outputs.short }}
+      sha: ${{ steps.tag.outputs.sha }}
+    steps:
+      - name: Resolve the upstream tag
+        id: tag
+        run: |
+          set -euo pipefail
+          if ! [[ "$TAG" =~ ^master-[0-9]+-([0-9a-f]{7})$ ]]; then
+            echo "::error::upstream_tag must look like master-883-137f740"
+            exit 1
+          fi
+          short="${BASH_REMATCH[1]}"
+          refs="$(git ls-remote "https://github.com/$UPSTREAM_REPO.git" "refs/tags/$TAG" "refs/tags/$TAG^{}")"
+          sha="$(printf '%s\n' "$refs" | awk '/\^\{\}$/ {print $1; found=1} END {}' | head -1)"
+          [ -n "$sha" ] || sha="$(printf '%s\n' "$refs" | awk '{print $1}' | head -1)"
+          if [ -z "$sha" ]; then echo "::error::$UPSTREAM_REPO has no tag $TAG"; exit 1; fi
+          case "$sha" in "$short"*) ;; *) echo "::error::$TAG points at $sha, not $short"; exit 1 ;; esac
+          echo "short=$short" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "$TAG -> $sha"
+
+  linux-arm64:
+    name: linux-${{ matrix.variant }}-arm64
+    needs: prepare
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: cuda13
+            suffix: "-cuda13"
+          - variant: cpu
+            suffix: ""
+    env:
+      VARIANT: ${{ matrix.variant }}
+      SUFFIX: ${{ matrix.suffix }}
+      SHORT: ${{ needs.prepare.outputs.short }}
+    steps:
+      - name: Clone upstream tag
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.prepare.outputs.sha }}
+          submodules: recursive
+
+      - name: Clone Atomic build files
+        uses: actions/checkout@v4
+        with:
+          path: _atomic
+          sparse-checkout: atomic
+
+      - name: Apply Atomic patches
+        run: bash _atomic/atomic/ci/apply-patches.sh
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      # GCC 14: GGML_CPU_ALL_VARIANTS builds armv9.2+SME variants that the 24.04 default GCC 13
+      # cannot assemble (same workaround as llama.cpp's arm64 jobs).
+      - name: Toolchain
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y build-essential gcc-14 g++-14 ninja-build zip file
+          echo "CC=gcc-14" >> "$GITHUB_ENV"
+          echo "CXX=g++-14" >> "$GITHUB_ENV"
+
+      # The SBSA repo is the one NVIDIA ships for DGX Spark / GH200-class machines; the `arm64`
+      # repo of the same distro is Jetson/L4T. cuda-driver-dev brings the libcuda stub that
+      # stable-diffusion links (CUDA::cuda_driver) when SD_CUDA is on.
+      - name: Install CUDA toolkit
+        if: matrix.variant == 'cuda13'
+        run: |
+          set -euo pipefail
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/sbsa/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            "cuda-nvcc-$LINUX_CUDA" "cuda-cccl-$LINUX_CUDA" "cuda-cudart-dev-$LINUX_CUDA" \
+            "libcublas-dev-$LINUX_CUDA" "cuda-driver-dev-$LINUX_CUDA" "cuda-cuobjdump-$LINUX_CUDA"
+          cuda_home="/usr/local/cuda-${LINUX_CUDA/-/.}"
+          echo "$cuda_home/bin" >> "$GITHUB_PATH"
+          echo "CUDA_HOME=$cuda_home" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          args=(
+            -G Ninja -DCMAKE_BUILD_TYPE=Release
+            -DSD_BUILD_SHARED_LIBS=ON -DSD_BUILD_SHARED_GGML_LIB=ON
+            -DGGML_NATIVE=OFF -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON '-DCMAKE_INSTALL_RPATH=$ORIGIN'
+          )
+          if [ "$VARIANT" = cuda13 ]; then
+            args+=(
+              -DSD_CUDA=ON "-DCMAKE_CUDA_ARCHITECTURES=$CUDA_ARCHS"
+              -DCMAKE_CUDA_HOST_COMPILER=g++-14 -DCMAKE_CUDA_FLAGS=-compress-mode=size
+            )
+          fi
+          cmake -S . -B build "${args[@]}"
+          cmake --build build -j "$(nproc)"
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          asset="sd-master-$SHORT-bin-Linux-$(lsb_release -si)-$(lsb_release -sr)-$(uname -m)$SUFFIX.zip"
+          bash _atomic/atomic/ci/package-linux.sh build/bin "$RUNNER_TEMP/pkg" "${CUDA_HOME:-}"
+          (cd "$RUNNER_TEMP/pkg" && zip -X -9 -q "$GITHUB_WORKSPACE/$asset" ./*)
+          ls -l "$asset"
+          echo "ASSET=$asset" >> "$GITHUB_ENV"
+
+      - name: Verify the archive
+        run: |
+          set -euo pipefail
+          pkg="$RUNNER_TEMP/pkg"
+          # The app unpacks zips with its own extractor, which writes a symlink out as a plain file.
+          if [ -n "$(find "$pkg" -type l)" ]; then find "$pkg" -type l; echo "::error::symlinks in the archive"; exit 1; fi
+          for f in sd-cli sd-server; do test -x "$pkg/$f" || { echo "::error::$f missing"; exit 1; }; done
+          for f in "$pkg"/*; do
+            if file -b "$f" | grep -q '^ELF'; then
+              file -b "$f" | grep -q 'ARM aarch64' || { echo "::error::$(basename "$f") is not aarch64"; exit 1; }
+            fi
+          done
+          # Everything resolves inside the archive except the NVIDIA driver itself.
+          missing="$(for f in "$pkg"/*; do file -b "$f" | grep -q '^ELF' && LD_LIBRARY_PATH="$pkg" ldd "$f" | sed "s|^|$(basename "$f"): |" | grep 'not found'; done | grep -v 'libcuda\.so\.1 ' || true)"
+          if [ -n "$missing" ]; then echo "$missing"; echo "::error::unresolved libraries"; exit 1; fi
+          if [ "$VARIANT" = cuda13 ]; then
+            cuobjdump --list-elf "$pkg/libggml-cuda.so" | tee "$RUNNER_TEMP/elf.txt"
+            grep -q 'sm_121' "$RUNNER_TEMP/elf.txt" || { echo "::error::no sm_121 code in libggml-cuda.so"; exit 1; }
+          fi
+          ls -l "$pkg"
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.variant }}-arm64
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+          retention-days: 14
+
+  windows-arm64-cpu:
+    needs: prepare
+    runs-on: windows-2022
+    timeout-minutes: 120
+    env:
+      SHORT: ${{ needs.prepare.outputs.short }}
+    steps:
+      - name: Clone upstream tag
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.prepare.outputs.sha }}
+          submodules: recursive
+
+      - name: Clone Atomic build files
+        uses: actions/checkout@v4
+        with:
+          path: _atomic
+          sparse-checkout: atomic
+
+      - name: Apply Atomic patches
+        shell: bash
+        run: bash _atomic/atomic/ci/apply-patches.sh
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Install Ninja
+        run: choco install ninja -y
+
+      # ggml-cpu refuses MSVC on ARM, so the whole tree is built with clang targeting
+      # arm64-pc-windows-msvc (llama.cpp's toolchain). GGML_CPU_ALL_VARIANTS has no Windows-ARM
+      # set; the toolchain pins -march=armv8.7-a (Snapdragon X, N1X). OpenMP is off: there is no
+      # arm64 libomp on the x64 host. Both Windows builds use the DLL CRT explicitly (sd.cpp's
+      # CMake 3.12 floor leaves CMP0091 OLD): sd-cli frees buffers stable-diffusion.dll allocated,
+      # and ggml-cuda.dll (MSVC) must share that heap with the clang half.
+      - name: Build
+        shell: cmd
+        run: |
+          call "%VS_VCVARS%" amd64_arm64 || exit /b 1
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release ^
+            -DCMAKE_TOOLCHAIN_FILE=_atomic/atomic/cmake/arm64-windows-llvm.cmake ^
+            -DGGML_NATIVE=OFF -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=OFF -DGGML_OPENMP=OFF ^
+            -DSD_BUILD_SHARED_LIBS=ON -DSD_BUILD_SHARED_GGML_LIB=ON ^
+            -DCMAKE_POLICY_DEFAULT_CMP0091=NEW -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL || exit /b 1
+          cmake --build build -j %NUMBER_OF_PROCESSORS% || exit /b 1
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $pkg = Join-Path $env:RUNNER_TEMP 'pkg'
+          & _atomic/atomic/ci/package-windows.ps1 -BinDir build\bin -OutDir $pkg -VcVars $env:VS_VCVARS
+          $asset = "sd-master-$env:SHORT-bin-win-cpu-arm64.zip"
+          7z a -tzip -mx=9 $asset "$pkg\*" | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "7z failed" }
+          Get-Item $asset | Format-List Name, Length
+          "ASSET=$asset" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: win-cpu-arm64
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload tree for the CUDA merge
+        uses: actions/upload-artifact@v4
+        with:
+          name: win-cpu-arm64-tree
+          path: ${{ runner.temp }}/pkg/
+          if-no-files-found: error
+          retention-days: 3
+
+  # Same split as llama.cpp's windows-cuda arm64 entry: the x64-hosted nvcc and MSVC cross-compile
+  # ggml-cuda.dll against NVIDIA's arm64 import libraries, and it is dropped into the clang tree
+  # (GGML_BACKEND_DL loads it at runtime). It must come from sd.cpp's own CMake tree, not from
+  # standalone ggml: sd.cpp compiles ggml with -DGGML_MAX_NAME=160, and a mismatch would break the
+  # ggml_tensor layout the two halves share. stable-diffusion.dll is the clang one and so lacks
+  # SD_USE_CUDA; that only disables a head-padding speed-up for d_head < 64 (atomic/README.md).
+  windows-arm64-cuda13:
+    needs: [prepare, windows-arm64-cpu]
+    runs-on: windows-2022
+    timeout-minutes: 240
+    env:
+      SHORT: ${{ needs.prepare.outputs.short }}
+    steps:
+      - name: Clone upstream tag
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.prepare.outputs.sha }}
+          submodules: recursive
+
+      - name: Clone Atomic build files
+        uses: actions/checkout@v4
+        with:
+          path: _atomic
+          sparse-checkout: atomic
+
+      - name: Apply Atomic patches
+        shell: bash
+        run: bash _atomic/atomic/ci/apply-patches.sh
+
+      - name: Install CUDA (x64 compiler, arm64 target libraries)
+        shell: pwsh
+        run: |
+          & _atomic/atomic/ci/install-cuda-windows-arm64.ps1 -Version $env:WIN_CUDA_REDIST -Root "C:\cuda-$env:WIN_CUDA_REDIST"
+
+      - name: Install Ninja
+        run: choco install ninja -y
+
+      - name: Build ggml-cuda
+        shell: cmd
+        run: |
+          call "%VS_VCVARS%" amd64_arm64 || exit /b 1
+          cmake -S . -B build-cuda -G Ninja -DCMAKE_BUILD_TYPE=Release ^
+            -DCMAKE_TOOLCHAIN_FILE=_atomic/atomic/cmake/arm64-windows-msvc-cuda.cmake ^
+            -DSD_CUDA=ON -DGGML_CPU=OFF -DGGML_NATIVE=OFF -DGGML_BACKEND_DL=ON ^
+            -DSD_BUILD_SHARED_LIBS=ON -DSD_BUILD_SHARED_GGML_LIB=ON ^
+            -DSD_BUILD_EXAMPLES=OFF -DSD_SERVER_BUILD_FRONTEND=OFF ^
+            -DCMAKE_POLICY_DEFAULT_CMP0091=NEW -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL ^
+            "-DCMAKE_CUDA_ARCHITECTURES=%CUDA_ARCHS%" || exit /b 1
+          cmake --build build-cuda --target ggml-cuda -j %NUMBER_OF_PROCESSORS% || exit /b 1
+
+      - name: Download the clang tree
+        uses: actions/download-artifact@v4
+        with:
+          name: win-cpu-arm64-tree
+          path: ${{ runner.temp }}/pkg
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $pkg = Join-Path $env:RUNNER_TEMP 'pkg'
+          $dll = Get-ChildItem build-cuda -Recurse -Filter ggml-cuda.dll | Select-Object -First 1
+          if (-not $dll) { throw "ggml-cuda.dll was not built" }
+          & _atomic/atomic/ci/package-windows.ps1 -OutDir $pkg -VcVars $env:VS_VCVARS `
+            -CudaDll $dll.FullName -CudaRoot $env:CUDA_PATH
+          $asset = "sd-master-$env:SHORT-bin-win-cuda13-arm64.zip"
+          7z a -tzip -mx=9 $asset "$pkg\*" | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "7z failed" }
+          Get-Item $asset | Format-List Name, Length
+          "ASSET=$asset" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: win-cuda13-arm64
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+          retention-days: 14
+
+  # Layer 0 of the verification plan: on native arm64 machines without a GPU, every archive must
+  # start, list its devices and generate a real image through sd-server's HTTP API.
+  smoke-linux:
+    name: smoke linux-${{ matrix.variant }}-arm64
+    needs: linux-arm64
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [cuda13, cpu]
+    steps:
+      - name: Clone Atomic build files
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: atomic
+
+      - name: Download archive
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-${{ matrix.variant }}-arm64
+          path: dist
+
+      - name: Unpack
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/sd"
+          unzip -q dist/*.zip -d "$RUNNER_TEMP/sd"
+          ls -l "$RUNNER_TEMP/sd"
+
+      # libstable-diffusion.so links libcuda.so.1, which only an NVIDIA driver provides. The
+      # toolkit's stub stands in for it here: cuInit fails cleanly and the CPU device remains.
+      - name: libcuda stub
+        if: matrix.variant == 'cuda13'
+        run: |
+          set -euo pipefail
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/sbsa/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update -y
+          sudo apt-get install -y "cuda-driver-dev-${{ env.LINUX_CUDA }}"
+          mkdir -p "$RUNNER_TEMP/stub"
+          ln -s "$(find /usr/local/cuda-*/ -path '*stubs/libcuda.so' | head -1)" "$RUNNER_TEMP/stub/libcuda.so.1"
+          echo "STUB_ARGS=--lib-dir $RUNNER_TEMP/stub" >> "$GITHUB_ENV"
+
+      - name: Cache smoke model
+        uses: actions/cache@v4
+        with:
+          path: ~/sd-smoke-model
+          key: sd-smoke-${{ env.SMOKE_MODEL_SHA256 }}
+
+      - name: Smoke
+        run: |
+          python3 atomic/ci/smoke.py --dir "$RUNNER_TEMP/sd" \
+            --model ~/sd-smoke-model/sd_turbo-f16-q8_0.gguf \
+            --model-url "$SMOKE_MODEL_URL" --model-sha256 "$SMOKE_MODEL_SHA256" \
+            --out "$RUNNER_TEMP/smoke.png" ${STUB_ARGS:-}
+
+      - name: Upload smoke image
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-linux-${{ matrix.variant }}-arm64
+          path: ${{ runner.temp }}/smoke.png
+          if-no-files-found: ignore
+          retention-days: 7
+
+  smoke-windows:
+    name: smoke win-${{ matrix.variant }}-arm64
+    needs: [windows-arm64-cpu, windows-arm64-cuda13]
+    runs-on: windows-11-arm
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [cuda13, cpu]
+    steps:
+      - name: Clone Atomic build files
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: atomic
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: arm64
+
+      - name: Download archive
+        uses: actions/download-artifact@v4
+        with:
+          name: win-${{ matrix.variant }}-arm64
+          path: dist
+
+      - name: Unpack and check PE machine types
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'sd'
+          Expand-Archive (Get-ChildItem dist\*.zip | Select-Object -First 1).FullName $dir -Force
+          & atomic/ci/check-pe-arm64.ps1 -Dir $dir
+          Get-ChildItem $dir | Format-Table Name, Length
+
+      - name: Cache smoke model
+        uses: actions/cache@v4
+        with:
+          path: ~/sd-smoke-model
+          key: sd-smoke-win-${{ env.SMOKE_MODEL_SHA256 }}
+
+      # No NVIDIA driver here: ggml-cuda.dll fails to load (no nvcuda.dll) and the CPU device
+      # remains, which is exactly what a Windows-on-Arm machine without NVIDIA will see.
+      - name: Smoke
+        shell: pwsh
+        run: |
+          python atomic/ci/smoke.py --dir (Join-Path $env:RUNNER_TEMP 'sd') `
+            --model (Join-Path $HOME 'sd-smoke-model\sd_turbo-f16-q8_0.gguf') `
+            --model-url $env:SMOKE_MODEL_URL --model-sha256 $env:SMOKE_MODEL_SHA256 `
+            --out (Join-Path $env:RUNNER_TEMP 'smoke.png')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload smoke image
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-win-${{ matrix.variant }}-arm64
+          path: ${{ runner.temp }}/smoke.png
+          if-no-files-found: ignore
+          retention-days: 7
+
+  release:
+    if: inputs.publish
+    needs: [prepare, smoke-linux, smoke-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      SHORT: ${{ needs.prepare.outputs.short }}
+      SHA: ${{ needs.prepare.outputs.sha }}
+    steps:
+      - name: Clone Atomic build files
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: atomic
+
+      - name: Download archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "{linux,win}-*-arm64"
+          path: dist
+          merge-multiple: true
+
+      - name: Render the verify scripts and checksums
+        run: |
+          set -euo pipefail
+          ls dist/*.zip | wc -l | grep -qx 4 || { ls -l dist; echo "::error::expected 4 archives"; exit 1; }
+          for f in verify-spark.ps1 verify-spark.cmd verify-spark.sh; do
+            sed -e "s|@TAG@|$TAG|g" -e "s|@SHORT@|$SHORT|g" -e "s|@REPO@|$GITHUB_REPOSITORY|g" "atomic/verify/$f" > "dist/$f"
+          done
+          (cd dist && sha256sum ./*.zip | sed 's| \./| |' > SHA256SUMS)
+          cat dist/SHA256SUMS
+
+      - name: Release notes
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          patches=(atomic/patches/*.patch)
+          {
+            echo "Atomic arm64 builds of [$UPSTREAM_REPO $TAG](https://github.com/$UPSTREAM_REPO/releases/tag/$TAG) (commit \`$SHA\`)."
+            echo
+            echo "| Backend id | Archive |"
+            echo "| --- | --- |"
+            for z in dist/*.zip; do
+              n="$(basename "$z")"
+              case "$n" in
+                *Linux*-aarch64-cuda13.zip) id=linux-cuda13-arm64 ;;
+                *Linux*-aarch64.zip) id=linux-cpu-arm64 ;;
+                *win-cuda13-arm64.zip) id=win-cuda13-arm64 ;;
+                *win-cpu-arm64.zip) id=win-cpu-arm64 ;;
+                *) id='?' ;;
+              esac
+              echo "| \`$id\` | \`$n\` |"
+            done
+            echo
+            echo "CUDA: Linux $LINUX_CUDA (SBSA), Windows $WIN_CUDA_REDIST; archs \`$CUDA_ARCHS\`. CUDA runtime libraries are bundled."
+            echo
+            if [ ${#patches[@]} -gt 0 ]; then
+              echo "Patches applied on top of the tag:"
+              for patch in "${patches[@]}"; do echo "- \`$(basename "$patch")\`"; done
+            else
+              echo "Source: the upstream tag as is (no patches)."
+            fi
+            echo
+            echo "Hardware check on an RTX Spark laptop: download \`verify-spark.cmd\` below and double-click it."
+            echo
+            echo "Built by [release-arm64.yml]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID) at \`$GITHUB_SHA\`."
+          } > notes.md
+          cat notes.md
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber -R "$GITHUB_REPOSITORY"
+            gh release edit "$TAG" --notes-file notes.md -R "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" dist/* --target "$SHA" -R "$GITHUB_REPOSITORY" \
+              --title "stable-diffusion.cpp $TAG (Atomic arm64)" --notes-file notes.md
+          fi

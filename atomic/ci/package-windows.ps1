@@ -30,8 +30,11 @@ $dumpbin = Get-ChildItem "$vsRoot\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" |
 if (-not $dumpbin) { throw "dumpbin.exe not found under $vsRoot" }
 $crt = Get-ChildItem "$vsRoot\VC\Redist\MSVC\*\$Arch\Microsoft.VC14*.CRT" -Directory | Sort-Object FullName | Select-Object -Last 1
 if (-not $crt) { throw "the $Arch VC++ redistributable is not installed under $vsRoot" }
+# vcomp140.dll (MSVC's OpenMP runtime, which ggml-base imports on x64) ships in its own folder.
+$omp = Get-ChildItem "$vsRoot\VC\Redist\MSVC\*\$Arch\Microsoft.VC14*.OpenMP" -Directory -ErrorAction SilentlyContinue | Sort-Object FullName | Select-Object -Last 1
+$redistDirs = @($crt.FullName) + @($omp | ForEach-Object { $_.FullName })
 Write-Host "dumpbin: $($dumpbin.FullName)"
-Write-Host "$Arch CRT: $($crt.FullName)"
+Write-Host "$Arch VC++ redist: $($redistDirs -join ', ')"
 
 if ($BinDir) {
   if (Test-Path $OutDir) { Remove-Item $OutDir -Recurse -Force }
@@ -72,9 +75,9 @@ for ($round = 0; $round -lt 5; $round++) {
       if ($allowed | Where-Object { $dep -like $_ }) { continue }
       $fromCuda = $cudaBins | ForEach-Object { Join-Path $_ $dep } | Where-Object { Test-Path $_ } | Select-Object -First 1
       if ($fromCuda) { Copy-Item $fromCuda $OutDir; $added = $true; Write-Host "+ $dep (CUDA)"; continue }
-      if (Test-Path (Join-Path $crt.FullName $dep)) {
-        Copy-Item (Join-Path $crt.FullName $dep) $OutDir; $added = $true; Write-Host "+ $dep (VC++ runtime)"; continue
-      }
+      # Before the System32 check: a runner has VS's runtimes there, a user's machine may not.
+      $fromRedist = $redistDirs | ForEach-Object { Join-Path $_ $dep } | Where-Object { Test-Path $_ } | Select-Object -First 1
+      if ($fromRedist) { Copy-Item $fromRedist $OutDir; $added = $true; Write-Host "+ $dep (VC++ redist)"; continue }
       if ($dep -like 'api-ms-win-*' -or $dep -like 'ext-ms-win-*' -or (Test-Path (Join-Path $system32 $dep))) { continue }
       $problems += "$($bin.Name) imports $dep, which is neither in the archive nor an OS DLL"
     }

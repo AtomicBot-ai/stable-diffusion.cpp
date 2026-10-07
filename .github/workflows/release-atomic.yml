@@ -525,7 +525,10 @@ jobs:
         run: choco install ninja -y
 
       # Upstream's flags, plus the DLL CRT stated explicitly (sd.cpp's CMake 3.12 floor leaves
-      # CMP0091 OLD): sd-cli frees buffers stable-diffusion.dll allocated.
+      # CMP0091 OLD): sd-cli frees buffers stable-diffusion.dll allocated. With SD_CUDA,
+      # stable-diffusion.dll imports the driver's nvcuda.dll (CUDA::cuda_driver); delay-loading it
+      # lets the engine start and fall back to the CPU without an NVIDIA driver. The driver API is
+      # only called on the CUDA backend, which needs the driver anyway.
       - name: Build
         shell: pwsh
         run: |
@@ -536,8 +539,10 @@ jobs:
           # passes it character by character.
           $extra = @(switch ($env:VARIANT) {
             'vulkan' { '-DSD_VULKAN=ON' }
-            'cuda12' { '-DSD_CUDA=ON', "-DCMAKE_CUDA_ARCHITECTURES=$env:CUDA_ARCHS_WIN_CUDA12", '-DCMAKE_CUDA_COMPILER_LAUNCHER=ccache' }
-            'cuda13' { '-DSD_CUDA=ON', "-DCMAKE_CUDA_ARCHITECTURES=$env:CUDA_ARCHS_WIN_CUDA13_X64", '-DCMAKE_CUDA_FLAGS=-compress-mode=size', '-DCMAKE_CUDA_COMPILER_LAUNCHER=ccache' }
+            'cuda12' { '-DSD_CUDA=ON', "-DCMAKE_CUDA_ARCHITECTURES=$env:CUDA_ARCHS_WIN_CUDA12", '-DCMAKE_CUDA_COMPILER_LAUNCHER=ccache',
+                       '-DCMAKE_SHARED_LINKER_FLAGS=/DELAYLOAD:nvcuda.dll delayimp.lib' }
+            'cuda13' { '-DSD_CUDA=ON', "-DCMAKE_CUDA_ARCHITECTURES=$env:CUDA_ARCHS_WIN_CUDA13_X64", '-DCMAKE_CUDA_FLAGS=-compress-mode=size', '-DCMAKE_CUDA_COMPILER_LAUNCHER=ccache',
+                       '-DCMAKE_SHARED_LINKER_FLAGS=/DELAYLOAD:nvcuda.dll delayimp.lib' }
           })
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=cl.exe -DCMAKE_CXX_COMPILER=cl.exe `
             '-DCMAKE_CXX_FLAGS=/bigobj' -DCMAKE_POLICY_DEFAULT_CMP0091=NEW -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL `

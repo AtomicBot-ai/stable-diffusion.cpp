@@ -16,21 +16,67 @@ They are consumed through `atomic-chat-conf/backends/sdcpp-manifest.json`; the c
 
 | Branch   | What it is                                                                 |
 | -------- | -------------------------------------------------------------------------- |
-| `master` | A fast-forward mirror of upstream `master`. Never commit here.             |
-| `atomic` | The default branch: upstream `master` plus **only added files** (`atomic/`, `.github/workflows/release-atomic.yml`). |
+| `master` | A fast-forward mirror of upstream `master`, moved by the pipeline through GitHub's merge-upstream API. Never commit here. |
+| `atomic` | The default branch: upstream at the last synced tag plus **only added files** (`atomic/`, `.github/workflows/release-atomic.yml`). |
+| `upstream-sync/<tag>` | One per upstream tag, made by the pipeline: `atomic` with the tag merged in. Built, tested, then merged into `atomic`. |
 
 Source code is never changed on a branch. Every build starts from an **upstream tag** and applies the
 patch series in [`atomic/patches/`](patches/). That keeps rebasing trivial and makes the release
 notes say exactly what differs from upstream.
+
+## How the pipeline updates this fork
+
+[atomic-hatchet-pipeline](https://github.com/AtomicBot-ai/atomic-hatchet-pipeline) (engine `sd-cpp`)
+watches leejet's tags. For a new `master-N-sha7` it:
+
+1. fast-forwards `master` to upstream with the merge-upstream API;
+2. creates `upstream-sync/<tag>` from `atomic` and merges the tag's commit into it (merges API);
+3. runs **Release (Atomic)** on that branch with `publish` and `replace`. The build is still the
+   upstream tag plus this branch's `atomic/`, so the branch is where every fix goes;
+4. if the `patches` job failed, its agent fixes `atomic/patches/` and pushes to the branch. Any other
+   failure is retried once, then given to the agent too. The agent gets one attempt; after it the
+   pipeline stops and asks for a human in Telegram;
+5. runs Atomic Chat core's tests on the release, and on green merges the PR `upstream-sync/<tag>` →
+   `atomic` (a merge commit). atomic-chat-conf then signs the archives and rolls them out as
+   `<tag>-a<rev>`, where `<rev>` is the first seven characters of the commit the build ran at.
+
+The agent's changes arrive as bot commits on `upstream-sync/<tag>`, so its PR shows them.
+
+Upstream's `build.yml`, `stale-prs.yml` and `close-inactive-issues.yml` come with every sync and must
+stay disabled in this fork's Actions: on a push to `master`, `build.yml` publishes its own release
+under the same tag (and it runs on the pipeline's PRs too), and the stale bots close PRs.
+
+### Fixing a sync by hand
+
+Work in the sync branch, never in `atomic` or `master`:
+
+```bash
+git fetch origin
+git switch upstream-sync/master-975-95b3090
+git submodule update --init --recursive
+bash atomic/ci/apply-patches.sh --check   # what the patches job saw, changes nothing
+```
+
+The branch holds upstream's tree at the tag, so a patch is reworked right there: apply it (e.g.
+`git apply --3way`), resolve, write the diff of the touched files back into the patch keeping its
+header, and restore the files. Commit only `atomic/` (or `release-atomic.yml`: a dispatch on the
+branch runs the branch's copy of the workflow), push, and re-run the pipeline for the same tag
+(atomic-hatchet-pipeline's `docs/engine-updater.md`). It builds the branch as it is now.
 
 ## Building a release
 
 Actions → **Release (Atomic)**:
 - `upstream_tag`: the tag Atomic Chat's manifest pins, e.g. `master-883-137f740`;
 - `targets`: `all`, or a comma-separated list of backend ids to rebuild while fixing one;
-- `publish`: creates the release of the tag here, and needs `all`.
+- `publish`: creates the release of the tag here, and needs `all`. If that release exists, the run
+  fails at once, unless
+- `replace` is on: the build's archives overwrite the release's, and archives this build no longer
+  names (a newer runner macOS, another ROCm) are removed;
+- `candidate_id`: goes into the run title as `[cid:<id>]`, which is how the pipeline finds its run;
+  `manual` by default.
 
-Then run `mirror-sdcpp.yml` in atomic-chat-conf for the same tag.
+The first job, `patches`, runs `atomic/ci/apply-patches.sh --check` on the tag; nothing is built if
+a patch does not apply. Then run `mirror-sdcpp.yml` in atomic-chat-conf for the same tag.
 
 Every archive except ROCm is smoke-tested on a machine without a GPU: it must start, list its devices,
 and generate an image through sd-server's HTTP API. On Linux this runs in a bare `python:3.12-slim`

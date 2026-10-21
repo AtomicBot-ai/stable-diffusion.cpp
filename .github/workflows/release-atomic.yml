@@ -1,4 +1,5 @@
 name: Release (Atomic)
+run-name: "Release (Atomic) ${{ inputs.upstream_tag }} [cid:${{ inputs.candidate_id }}]"
 
 # Builds every stable-diffusion.cpp engine Atomic Chat ships, from an unmodified upstream tag plus
 # the patch series in atomic/patches, and publishes them as one release of that tag here:
@@ -14,6 +15,10 @@ name: Release (Atomic)
 # Asset names follow upstream's pattern (sd-master-<sha7>-bin-...), so atomic-chat-conf's
 # mirror-sdcpp.yml matches them by pattern. `targets` rebuilds a subset while fixing one; a release
 # needs `all`. See atomic/README.md.
+#
+# The hatchet pipeline (AtomicBot-ai/atomic-hatchet-pipeline) dispatches this on upstream-sync/<tag>
+# with publish and replace, finds the run by [cid:...] in its title, and tells a patch conflict from
+# a broken build by which job failed: the one named `patches` or another.
 
 on:
   workflow_dispatch:
@@ -28,10 +33,20 @@ on:
         default: all
         type: string
       publish:
-        description: "Create or update the release of that tag in this repository"
+        description: "Create the release of that tag in this repository"
         required: false
         default: false
         type: boolean
+      replace:
+        description: "Replace that release's archives if it already exists; without it publishing fails"
+        required: false
+        default: false
+        type: boolean
+      candidate_id:
+        description: "Id the caller finds this run by in its title"
+        required: false
+        default: manual
+        type: string
 
 concurrency:
   group: release-atomic-${{ inputs.upstream_tag }}-${{ inputs.targets }}
@@ -71,6 +86,25 @@ jobs:
       smoke_linux: ${{ steps.plan.outputs.smoke_linux }}
       smoke_windows: ${{ steps.plan.outputs.smoke_windows }}
     steps:
+      # The pipeline matches [cid:<id>] in the run title literally: no spaces or brackets in it.
+      # An existing release without `replace` would fail only in the release job, hours later.
+      - name: Check inputs
+        env:
+          CANDIDATE_ID: ${{ inputs.candidate_id }}
+          PUBLISH: ${{ inputs.publish }}
+          REPLACE: ${{ inputs.replace }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$CANDIDATE_ID" =~ ^[A-Za-z0-9._:-]{1,80}$ ]]; then
+            echo "::error::candidate_id must match ^[A-Za-z0-9._:-]{1,80}\$"
+            exit 1
+          fi
+          if [ "$PUBLISH" = true ] && [ "$REPLACE" != true ] && gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::release $TAG already exists here; run with replace to overwrite its archives"
+            exit 1
+          fi
+
       - name: Resolve the upstream tag
         id: tag
         run: |
@@ -151,9 +185,33 @@ jobs:
                   print(f"{k}={v}")
           EOF
 
+  # The series must apply to the tag before any runner spends hours on it. The hatchet pipeline reads
+  # a failure of the job named `patches` as a patch conflict (its agent fixes the series in this
+  # branch) and any other failure as a broken build, so keep the id and the name, and keep every
+  # build job behind it. prepare only checks the inputs.
+  patches:
+    name: patches
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Clone upstream tag
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.prepare.outputs.sha }}
+          submodules: recursive
+      - name: Clone Atomic build files
+        uses: actions/checkout@v4
+        with:
+          path: _atomic
+          sparse-checkout: atomic
+      - name: Check the patch series
+        run: bash _atomic/atomic/ci/apply-patches.sh --check
+
   # ----------------------------------------------------------------------------------- macOS
   macos-arm64:
-    needs: prepare
+    needs: [prepare, patches]
     if: contains(needs.prepare.outputs.selected, ',macos-arm64,')
     runs-on: macos-latest
     timeout-minutes: 120
@@ -218,7 +276,7 @@ jobs:
   # ----------------------------------------------------------------------------------- Linux
   linux:
     name: ${{ matrix.id }}
-    needs: prepare
+    needs: [prepare, patches]
     if: needs.prepare.outputs.linux != '[]'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 300
@@ -349,7 +407,7 @@ jobs:
   # Upstream's ROCm job (TheRock wheels). The ROCm runtime is not bundled, as upstream: users
   # install it; the archive is made flat and symlink-free like every other Linux one here.
   linux-rocm-x64:
-    needs: prepare
+    needs: [prepare, patches]
     if: contains(needs.prepare.outputs.selected, ',linux-rocm-x64,')
     runs-on: ubuntu-24.04
     timeout-minutes: 300
@@ -453,7 +511,7 @@ jobs:
   # ------------------------------------------------------------------------- Windows x64 (MSVC)
   windows-x64:
     name: ${{ matrix.id }}
-    needs: prepare
+    needs: [prepare, patches]
     if: needs.prepare.outputs.windows_x64 != '[]'
     runs-on: windows-2022
     timeout-minutes: 330
@@ -586,7 +644,7 @@ jobs:
   # Upstream's Windows ROCm job (TheRock wheels). amdhip64 comes with the AMD driver, which no
   # runner has, so unresolved imports are reported, not fatal.
   windows-rocm-x64:
-    needs: prepare
+    needs: [prepare, patches]
     if: contains(needs.prepare.outputs.selected, ',win-rocm-x64,')
     runs-on: windows-2022
     timeout-minutes: 330
@@ -698,7 +756,7 @@ jobs:
   # (llama.cpp's toolchain); -march=armv8.7-a covers Snapdragon X and N1X. OpenMP is off: there is
   # no arm64 libomp on the x64 host. The DLL CRT is explicit: ggml-cuda.dll (MSVC) shares its heap.
   windows-arm64-cpu:
-    needs: prepare
+    needs: [prepare, patches]
     if: contains(needs.prepare.outputs.selected, ',win-cpu-arm64,')
     runs-on: windows-2022
     timeout-minutes: 120
@@ -775,7 +833,7 @@ jobs:
   # a standalone ggml would disagree on the ggml_tensor layout); it is dropped into the clang tree.
   # The clang stable-diffusion.dll lacks SD_USE_CUDA: no head padding for d_head < 64 (speed only).
   windows-arm64-cuda13:
-    needs: [prepare, windows-arm64-cpu]
+    needs: [prepare, patches, windows-arm64-cpu]
     if: contains(needs.prepare.outputs.selected, ',win-cuda13-arm64,')
     runs-on: windows-2022
     timeout-minutes: 240
@@ -919,9 +977,11 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  # A subset build skips some Windows jobs, so skipped ones are let through; `patches` is listed so
+  # that its failure, which skips all of them, is not.
   smoke-windows:
     name: smoke ${{ matrix.id }}
-    needs: [prepare, windows-x64, windows-arm64-cpu, windows-arm64-cuda13]
+    needs: [prepare, patches, windows-x64, windows-arm64-cpu, windows-arm64-cuda13]
     if: >-
       always() && needs.prepare.outputs.smoke_windows != '[]' &&
       !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
@@ -1088,13 +1148,26 @@ jobs:
           } > notes.md
           cat notes.md
 
+      # Asset names carry the runner's macOS and the ROCm version, so a rebuild can name an archive
+      # differently; the old one is removed, since mirror-sdcpp.yml refuses two matches of a pattern.
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
+          REPLACE: ${{ inputs.replace }}
         run: |
           set -euo pipefail
           if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            if [ "$REPLACE" != true ]; then
+              echo "::error::release $TAG already exists here; run with replace to overwrite its archives"
+              exit 1
+            fi
             gh release upload "$TAG" dist/* --clobber -R "$GITHUB_REPOSITORY"
+            for name in $(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name'); do
+              if [ ! -e "dist/$name" ]; then
+                echo "removing $name, not in this build"
+                gh release delete-asset "$TAG" "$name" -y -R "$GITHUB_REPOSITORY"
+              fi
+            done
             gh release edit "$TAG" --notes-file notes.md --title "stable-diffusion.cpp $TAG (Atomic)" -R "$GITHUB_REPOSITORY"
           else
             gh release create "$TAG" dist/* --target "$SHA" -R "$GITHUB_REPOSITORY" \

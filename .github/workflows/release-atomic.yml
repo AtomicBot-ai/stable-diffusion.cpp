@@ -7,7 +7,7 @@ run-name: "Release (Atomic) ${{ inputs.upstream_tag }} [cid:${{ inputs.candidate
 #   upstream parity (same flags as leejet's build.yml at the tag)
 #     macos-arm64        universal (arm64 + x86_64), Metal
 #     win-cpu-x64  win-vulkan-x64  win-cuda12-x64 (+ cudart-sd-bin-win-cu12-x64 companion)  win-rocm-x64
-#     linux-cpu-x64  linux-vulkan-x64  linux-rocm-x64
+#     linux-cpu-x64  linux-vulkan-x64  linux-rocm-x64 (built on request only, see below)
 #   Atomic additions
 #     linux-cpu-arm64  linux-cuda13-arm64 (DGX Spark / GB10)  win-cpu-arm64  win-cuda13-arm64 (RTX Spark / N1X)
 #     linux-cuda12-x64   win-cuda13-x64
@@ -15,6 +15,11 @@ run-name: "Release (Atomic) ${{ inputs.upstream_tag }} [cid:${{ inputs.candidate
 # Asset names follow upstream's pattern (sd-master-<sha7>-bin-...), so atomic-chat-conf's
 # mirror-sdcpp.yml matches them by pattern. `targets` rebuilds a subset while fixing one; a release
 # needs `all`. See atomic/README.md.
+#
+# linux-rocm-x64 is not part of `all`: its build hung in Build for hours on master-975 and
+# master-982 and held every release behind it. The core never picks it (Linux x64 goes to Vulkan,
+# then CPU; ROCm is chosen on Windows only) and mirror-sdcpp.yml treats it as optional, so releases
+# ship without it until the build is fixed. Name it in `targets` to build it on its own.
 #
 # The hatchet pipeline (AtomicBot-ai/atomic-hatchet-pipeline) dispatches this on upstream-sync/<tag>
 # with publish and replace, finds the run by [cid:...] in its title, and tells a patch conflict from
@@ -150,14 +155,17 @@ jobs:
               linux("linux-cuda13-arm64", "arm64", "cuda13", "-cuda13", "13-0", "90-virtual;121-real", "sm_121"),
           ]
           WIN_X64 = [dict(id=f"win-{v}-x64", variant=v) for v in ("cpu", "vulkan", "cuda12", "cuda13")]
-          SINGLE = ["macos-arm64", "linux-rocm-x64", "win-rocm-x64", "win-cpu-arm64", "win-cuda13-arm64"]
+          SINGLE = ["macos-arm64", "win-rocm-x64", "win-cpu-arm64", "win-cuda13-arm64"]
+          # Built only when named: not in a release (see the header)
+          ON_REQUEST = ["linux-rocm-x64"]
           ALL = [e["id"] for e in LINUX] + [e["id"] for e in WIN_X64] + SINGLE
+          KNOWN = ALL + ON_REQUEST
 
           raw = os.environ.get("TARGETS", "").strip()
           sel = list(ALL) if raw in ("", "all") else [t.strip() for t in raw.split(",") if t.strip()]
-          unknown = sorted(set(sel) - set(ALL))
+          unknown = sorted(set(sel) - set(KNOWN))
           if unknown:
-              print(f"::error::unknown targets {unknown}; known: {ALL}")
+              print(f"::error::unknown targets {unknown}; known: {KNOWN}")
               sys.exit(1)
           build = set(sel)
           if "win-cuda13-arm64" in build:
@@ -1081,7 +1089,7 @@ jobs:
   # ----------------------------------------------------------------------------------- Release
   release:
     if: inputs.publish && needs.prepare.outputs.all == 'true'
-    needs: [prepare, macos-arm64, linux, linux-rocm-x64, windows-x64, windows-rocm-x64, windows-arm64-cpu,
+    needs: [prepare, macos-arm64, linux, windows-x64, windows-rocm-x64, windows-arm64-cpu,
             windows-arm64-cuda13, smoke-linux, smoke-windows, smoke-macos]
     runs-on: ubuntu-latest
     permissions:
@@ -1105,7 +1113,7 @@ jobs:
         run: |
           set -euo pipefail
           n="$(ls dist/*.zip | wc -l)"
-          [ "$n" -eq 15 ] || { ls -l dist; echo "::error::expected 15 archives, got $n"; exit 1; }
+          [ "$n" -eq 14 ] || { ls -l dist; echo "::error::expected 14 archives, got $n"; exit 1; }
           for f in verify-spark.ps1 verify-spark.cmd verify-spark.sh; do
             sed -e "s|@TAG@|$TAG|g" -e "s|@SHORT@|$SHORT|g" -e "s|@REPO@|$GITHUB_REPOSITORY|g" "atomic/verify/$f" > "dist/$f"
           done
@@ -1135,7 +1143,7 @@ jobs:
               echo "| \`$id\` | \`$name\` |"
             done
             echo
-            echo "Same flags as upstream for its nine archives; Atomic additions: arm64 Linux and Windows on Arm (CUDA 13), linux-cuda12-x64, win-cuda13-x64. Linux archives are flat, symlink-free and carry their non-base runtime libraries (libgomp, the CUDA runtime)."
+            echo "Same flags as upstream for eight of its nine archives (linux-rocm-x64 is left out until its build stops hanging); Atomic additions: arm64 Linux and Windows on Arm (CUDA 13), linux-cuda12-x64, win-cuda13-x64. Linux archives are flat, symlink-free and carry their non-base runtime libraries (libgomp, the CUDA runtime)."
             echo
             if [ ${#patches[@]} -gt 0 ]; then
               echo "Patches applied on top of the tag:"

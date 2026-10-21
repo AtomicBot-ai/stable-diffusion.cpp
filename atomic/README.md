@@ -5,7 +5,9 @@ ships, from an unmodified [leejet/stable-diffusion.cpp](https://github.com/leeje
 
 - **upstream's nine archives, with upstream's flags:** `macos-arm64`; `win-cpu-x64`, `win-vulkan-x64`,
   `win-cuda12-x64` (+ the `cudart-sd-bin-win-cu12-x64` companion) and `win-rocm-x64`; `linux-cpu-x64`,
-  `linux-vulkan-x64` and `linux-rocm-x64`;
+  `linux-vulkan-x64` and `linux-rocm-x64`. `linux-rocm-x64` is built on request only (`targets`) and
+  is not in a release: its build hung for hours and held every release behind it, and the core never
+  picks it (Linux x64 runs Vulkan, then CPU);
 - **archives upstream does not publish:** `linux-cpu-arm64` and `linux-cuda13-arm64` (DGX Spark / GB10),
   `win-cpu-arm64` and `win-cuda13-arm64` (RTX Spark / N1X), `linux-cuda12-x64`, and `win-cuda13-x64`.
 

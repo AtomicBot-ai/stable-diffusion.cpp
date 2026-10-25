@@ -128,7 +128,8 @@ To disable reference resizing before VAE encoding, use
 `--ref-image-args "resize_before_vae=false"` or the server field
 `"ref_image_args": "resize_before_vae=false"`. This is separate from
 `target=ref,mode=none`, which only skips input geometry. Model constraints
-still apply.
+still apply; MiniMax-H3 requires 32-pixel-aligned references and warns instead
+of honoring the switch.
 
 ## Server requests
 
@@ -148,12 +149,12 @@ an array of rule strings:
 OpenAI-compatible requests accept it through
 `<sd_cpp_extra_args>{...}</sd_cpp_extra_args>` in the prompt.
 Request rules replace server-default rules. Generation metadata records the
-user rules; image encodings and channel conventions are unchanged.
+user rules for replay with the same input images; image encodings and channel conventions are unchanged.
 
 ## C API
 
 Set `image_preprocess` on the existing image/video generation parameters.
-The `generate_image()` and `generate_video()` signatures are unchanged:
+Generation returns media and actual parameters together; see [generation metadata](generation_metadata.md):
 
 ```c
 sd_img_gen_params_t params;
@@ -161,7 +162,10 @@ sd_img_gen_params_init(&params);
 /* Set prompt, original-resolution input images, and generation options. */
 params.image_preprocess.rules = "target=init,mode=crop-resize,filter=lanczos;"
                                 "target=mask,filter=nearest-exact";
-bool ok = generate_image(ctx, &params, &images, &count);
+sd_image_generation_result_t* result = NULL;
+bool ok = generate_image(ctx, &params, &result);
+/* Consume result->items and their generation_info on success. */
+free_sd_image_generation_result(result);
 ```
 
 Both generation parameter initializers set `image_preprocess.rules` to `NULL`,

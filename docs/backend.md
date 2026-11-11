@@ -135,7 +135,10 @@ regardless of argument order, even with `--auto-fit on`.
 
 Auto-fit preserves explicit `--backend` assignments, including per-module
 assignments and device lists. For modules without a runtime assignment, it chooses
-the GPU with the largest available memory budget (the first device on a tie).
+the discrete GPU with the largest positive memory budget (the first device on a
+tie), falling back to integrated GPUs when no discrete GPU has a positive budget.
+An integrated GPU's shared system memory does not give it priority over a discrete
+GPU. Explicit assignments such as `--backend Vulkan1` still select that device.
 It then derives parameter placements from the model metadata, each module's
 compute devices, and the remaining memory budgets. The chosen backend
 specifications are printed.
@@ -157,10 +160,12 @@ the runner's graph-cut capacity checks.
 Runtime capacity checks also leave 512 MiB of currently free device memory for
 backend scratch buffers and pipelines, including with explicit backend assignments.
 They cap free-memory reports by the device's total memory minus tracked
-resident allocations. Vulkan reports exceeding total memory are rejected because
-its heap-budget subtraction can underflow. Other backends use the cap instead of
-treating such reports as zero free memory. Failed checks log the reported free and
-total memory alongside tracked weight and runtime allocations.
+resident allocations. Vulkan reports exceeding total memory are rejected on
+discrete GPUs because its heap-budget subtraction can underflow. On integrated
+GPUs, a wrapped report triggers reclamation before the tracked estimate can be
+accepted, subject to the byte checks and configured budgets. Other backends use
+the cap instead of treating such reports as zero free memory. Failed checks log
+the reported free and total memory alongside tracked weight and runtime allocations.
 With `--mmap`, device-backed mappings count toward these budgets at their full
 mapped-file size, once per device buffer even when multiple parameter blocks
 share it. Mappings retained in the loader cache continue to count.
@@ -178,8 +183,18 @@ GPU cache space follows the same component priority. Before a lower-priority
 component can become permanently resident, the planner leaves room for the full
 weights and estimated compute space of higher-priority offloaded components.
 If offloaded diffusion already needs the entire main GPU budget, TE and VAE also
-use offloaded parameters. Their GPU copies can then be released after their
-phases, leaving more room to reuse diffusion weights across sampling steps.
+use offloaded parameters. GPU copies remain cached across sampling steps while
+a component's execution is active and are released under memory pressure.
+Ending a component's execution releases its staged GPU copies, disk-backed
+weight buffers, temporary compute buffers and execution caches. Parameters
+assigned permanently to a backend remain resident. Hires model upscaling shares
+the runtime budget and can
+reclaim idle weight copies from other components.
+Reclamation releases idle compute buffers first, then cached weight allocations
+until the current work fits. Weights used by active computation or pending
+transfers stay protected.
+For CPU computation with disk-backed parameters, cached weights are released
+when execution ends so they do not accumulate in RAM across components.
 CPU parameter residency allows GPU weight caching; it does not force every
 weight to be copied again at every step.
 

@@ -46,7 +46,40 @@ namespace SD_CUDA_NAMESPACE {
             return __fmul_rn(__fmul_rn(a, 1.0f / (1.0f + expf(-gate))), b);
         }
 
-        template <bool swiglu, bool dequantize = false, bool normalize = false, bool scaled = false, bool warp_rotation = false, typename T = float, bool sigmoid_gate = false, bool rms_modulation = false, bool modulate = false, bool situ_gate = false>
+        static __device__ __forceinline__ void rotate_h256(float (&v)[8], int lane) {
+            // One logical warp owns H256, keeping every butterfly in registers.
+#pragma unroll
+            for (int stride = 1; stride <= 4; stride *= 4) {
+                const int base = lane & ~(3 * stride);
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const float a = cuda_shuffle(v[j], base, 32);
+                    const float b = cuda_shuffle(v[j], base + stride, 32);
+                    const float c = cuda_shuffle(v[j], base + 2 * stride, 32);
+                    const float d = cuda_shuffle(v[j], base + 3 * stride, 32);
+                    v[j]          = convrot_h4_cuda(a, b, c, d, (lane / stride) % 4);
+                }
+            }
+#pragma unroll
+            for (int j = 0; j < 8; j += 2) {
+                const float a = cuda_shuffle(v[j], lane % 16, 32);
+                const float b = cuda_shuffle(v[j], lane % 16 + 16, 32);
+                const float c = cuda_shuffle(v[j + 1], lane % 16, 32);
+                const float d = cuda_shuffle(v[j + 1], lane % 16 + 16, 32);
+                v[j]          = convrot_h4_cuda(a, b, c, d, lane / 16);
+                v[j + 1]      = convrot_h4_cuda(a, b, c, d, 2 + lane / 16);
+            }
+#pragma unroll
+            for (int j = 0; j < 2; ++j) {
+                const float a = v[j], b = v[j + 2], c = v[j + 4], d = v[j + 6];
+#pragma unroll
+                for (int t = 0; t < 4; ++t) {
+                    v[j + 2 * t] = convrot_h4_cuda(a, b, c, d, t);
+                }
+            }
+        }
+
+        template <bool swiglu, bool dequantize = false, bool normalize = false, bool scaled = false, bool warp_rotation = false, typename T = float, bool sigmoid_gate = false, bool rms_modulation = false, bool modulate = false, bool situ_gate = false, bool gelu = false, bool rms_vec = false, bool rotate = true>
         __global__ void quantize(
             const T* src,
             int8_t* dst,
@@ -65,7 +98,9 @@ namespace SD_CUDA_NAMESPACE {
             float input_bias               = 0.0f,
             const float* rms_weight        = nullptr,
             const float* rms_shift         = nullptr) {
-            constexpr int group_size = 256;
+            constexpr int group_size       = 256;
+            constexpr float rotation_scale = rotate ? (1.0f / 16.0f) : 1.0f;
+            static_assert(rotate || swiglu || warp_rotation);
 
             const int64_t row = blockIdx.x;
             const int tid     = threadIdx.x;
@@ -81,12 +116,18 @@ namespace SD_CUDA_NAMESPACE {
             [[maybe_unused]] float rms_scale = 1.0f;
             if constexpr (rms_modulation) {
                 __shared__ float sums[32];
-                // Preserve the unfused RMSNorm's 1024-thread reduction order with fewer physical warps.
-                for (int virtual_tid = tid; virtual_tid < 1024; virtual_tid += blockDim.x) {
+                // Match the unfused RMSNorm reduction across a smaller physical block.
+                const int reduction_threads = rms_vec ? k / 4 : 1024;
+                for (int virtual_tid = tid; virtual_tid < reduction_threads; virtual_tid += blockDim.x) {
                     float partial = 0.0f;
-                    for (int64_t i = virtual_tid; i < k; i += 1024) {
-                        const float value = src_row[i];
-                        partial += value * value;
+                    if constexpr (rms_vec) {
+                        const float4 a = reinterpret_cast<const float4*>(src_row)[virtual_tid];
+                        partial        = a.x * a.x + a.y * a.y + a.z * a.z + a.w * a.w;
+                    } else {
+                        for (int64_t i = virtual_tid; i < k; i += 1024) {
+                            const float value = src_row[i];
+                            partial += value * value;
+                        }
                     }
                     partial = warp_reduce_sum(partial);
                     if (tid % 32 == 0) {
@@ -94,7 +135,8 @@ namespace SD_CUDA_NAMESPACE {
                     }
                 }
                 __syncthreads();
-                const float sum = warp_reduce_sum(sums[tid % 32]);
+                const int lane  = tid % 32;
+                const float sum = warp_reduce_sum(lane < reduction_threads / 32 ? sums[lane] : 0.f);
                 rms_scale       = rsqrtf(sum / k + eps);
             }
 
@@ -108,7 +150,10 @@ namespace SD_CUDA_NAMESPACE {
                         if constexpr (!swiglu) {
                             float value = src_row[i];
                             if constexpr (rms_modulation) {
-                                value = __fmul_rn(__fmul_rn(value, rms_scale), rms_weight[i]);
+                                value = __fmul_rn(value, rms_scale);
+                                if constexpr (!rms_vec) {
+                                    value = __fmul_rn(value, rms_weight[i]);
+                                }
                             }
                             if constexpr (rms_modulation || modulate) {
                                 value = __fadd_rn(value, __fmul_rn(value, modulation[i]));
@@ -119,7 +164,10 @@ namespace SD_CUDA_NAMESPACE {
                             if constexpr (scaled) {
                                 value = __fmaf_rn(value, input_scale, input_bias);
                             }
-                            v[j] = value * (1.0f / 16.0f);
+                            if constexpr (gelu) {
+                                value = 0.5f * value * (1.0f + tanhf(0.7978845608028654f * value * (1.0f + 0.044715f * value * value)));
+                            }
+                            v[j] = value * rotation_scale;
                         } else {
                             float gate_value, up_value;
                             if constexpr (dequantize) {
@@ -132,42 +180,24 @@ namespace SD_CUDA_NAMESPACE {
                                 up_value   = up[row * up_stride + i];
                             }
                             if constexpr (situ_gate) {
-                                v[j] = situ(gate_value, up_value) * (1.0f / 16.0f);
+                                v[j] = situ(gate_value, up_value) * rotation_scale;
                             } else {
                                 const float activated = sigmoid_gate ? 1.0f / (1.0f + expf(-gate_value)) : (gate_value / (1.0f + expf(-gate_value)));
-                                v[j]                  = (activated * up_value) * (1.0f / 16.0f);
+                                v[j]                  = (activated * up_value) * rotation_scale;
                             }
                         }
                     }
-                    // One logical warp owns H256, keeping every butterfly in registers.
-#pragma unroll
-                    for (int stride = 1; stride <= 4; stride *= 4) {
-                        const int base = lane & ~(3 * stride);
+                    if constexpr (!rotate) {
 #pragma unroll
                         for (int j = 0; j < 8; ++j) {
-                            const float a = cuda_shuffle(v[j], base, 32);
-                            const float b = cuda_shuffle(v[j], base + stride, 32);
-                            const float c = cuda_shuffle(v[j], base + 2 * stride, 32);
-                            const float d = cuda_shuffle(v[j], base + 3 * stride, 32);
-                            v[j]          = convrot_h4_cuda(a, b, c, d, (lane / stride) % 4);
+                            values[group * group_size + j * 32 + lane] = v[j];
                         }
+                        continue;
                     }
+                    rotate_h256(v, lane);
 #pragma unroll
-                    for (int j = 0; j < 8; j += 2) {
-                        const float a = cuda_shuffle(v[j], lane % 16, 32);
-                        const float b = cuda_shuffle(v[j], lane % 16 + 16, 32);
-                        const float c = cuda_shuffle(v[j + 1], lane % 16, 32);
-                        const float d = cuda_shuffle(v[j + 1], lane % 16 + 16, 32);
-                        v[j]          = convrot_h4_cuda(a, b, c, d, lane / 16);
-                        v[j + 1]      = convrot_h4_cuda(a, b, c, d, 2 + lane / 16);
-                    }
-#pragma unroll
-                    for (int j = 0; j < 2; ++j) {
-                        const float a = v[j], b = v[j + 2], c = v[j + 4], d = v[j + 6];
-#pragma unroll
-                        for (int t = 0; t < 4; ++t) {
-                            values[group * group_size + (j + 2 * t) * 32 + lane] = convrot_h4_cuda(a, b, c, d, t);
-                        }
+                    for (int j = 0; j < 8; ++j) {
+                        values[group * group_size + j * 32 + lane] = v[j];
                     }
                 }
                 __syncthreads();
@@ -260,7 +290,6 @@ namespace SD_CUDA_NAMESPACE {
                 dst_row[i] = (int8_t)value;
             }
         }
-
     }
 }
 #endif

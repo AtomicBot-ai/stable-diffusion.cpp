@@ -1,5 +1,9 @@
 ## Use Flash Attention to save memory and improve speed.
 
+DGL versions of the generation examples are linked below. Edit each script's
+`var` block and follow the [DGL run instructions](../dgl/README.md).
+
+
 Enabling flash attention for the diffusion model reduces memory usage by varying amounts of MB.
 eg.:
  - flux 768x768 ~600mb
@@ -48,6 +52,11 @@ run qualifies for it.
 
 Use `--batched-cfg off` to force separate conditional and unconditional
 forwards.
+
+In DGL mode the flag sets `batched_cfg` on the execution context. Compatible
+`cfg(positive, negative, ...)` branches use batching automatically; combinations
+that require separate forwards retain their original execution. See
+[DGL context execution settings](../dgl.md#context-execution-settings).
 
 ## Use VAE tiling to reduce encode and decode memory usage.
 
@@ -139,7 +148,7 @@ See [backend selection](./backend.md) for full syntax.
 
 `--offload-to-cpu` keeps the source parameters in system RAM and creates compute-side GPU replicas on demand. Unpinned replicas remain resident for reuse, but automatic graph-cut execution evicts them from the last segment backward when the next weight or compute allocation needs space. Disk-backed parameters follow the same policy without retaining a RAM source copy.
 
-When a graph has cut markers and its missing weights plus incremental compute workspace exceed the available device headroom, it runs its fixed segment list in order. A reusable monolithic compute buffer is not counted as a new allocation. An explicit `--max-vram` budget deducts already-resident managed weights and compute/cache buffers registered by every runner sharing the device, so later graph runs remain segmented when the full graph exceeds the budget. The current segment's weights are pinned during compute, and the next parameter-bearing segment is prefetched when the device supports asynchronous transfer. No opt-in streaming flag is required.
+When a graph has cut markers and its missing weights plus incremental compute workspace exceed the available device headroom, it runs its fixed segment list in order. An existing monolithic workspace can be reused without a new allocation. An explicit `--max-vram` budget includes resident managed weights, compute and cache buffers registered by runners sharing the device, and ggml's idle buffer pool. The current segment's weights are pinned during compute, and the next parameter-bearing segment is prefetched when the device supports asynchronous transfer. No opt-in streaming flag is required.
 
 When choosing between monolithic and segmented execution, the runner requires
 an additional 128 MiB of headroom in both available device memory and any explicit
@@ -161,12 +170,14 @@ allocator/scheduler capacity. Compatible gallocr reservations are reused across
 graphs; idle workspaces can be reclaimed under pressure and are freed at runner
 completion. Cross-graph caches survive individual graphs, but cut buffers do not.
 
-On discrete Vulkan devices, runners reuse released device buffers of the same
-size to reduce allocation overhead during segmented execution. This idle buffer
-cache is limited to 1 GiB per device and is reclaimed before allocating a new
-size or at runner completion. It is outside the managed `--max-vram` budget,
-so physical VRAM usage can be higher. Set `GGML_VK_REUSE_BUFFERS=0` to disable
-it. Unified-memory and host-memory modes do not use this cache.
+CUDA, HIP, and discrete Vulkan can reuse released device buffers of the same
+size. The pool retains up to 4 GiB per device for CUDA and HIP and up to 1 GiB
+for Vulkan, subject to the remaining device budget. Under pressure, the runner
+trims idle buffers and can pass a matching evicted CUDA or HIP weight buffer
+directly to a prefetch. Set
+`GGML_CUDA_REUSE_BUFFERS=0` for CUDA or HIP, or `GGML_VK_REUSE_BUFFERS=0` for
+Vulkan, to disable the pool. Vulkan also disables the pool when it prefers host
+memory. Unified-memory mode disables the pool.
 
 Discrete NVIDIA and non-GCN AMD Vulkan devices use a separate transfer queue by
 default when available and graphics queue use is disabled, so weight prefetch can overlap compute. Set
@@ -186,6 +197,7 @@ The recommended shape for "biggest model my card can host" is:
 sd-cli --diffusion-model flux1-dev.safetensors ... \
        --offload-to-cpu --max-vram -1
 ```
+
 
 - `--offload-to-cpu`: params in RAM, staged as needed.
 - `--max-vram -1`: reserve about 1 GiB from the startup free-memory snapshot; live free memory can still lower the effective limit for every graph.

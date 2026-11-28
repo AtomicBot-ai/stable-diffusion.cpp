@@ -214,21 +214,49 @@ ggml_tensor* ggml_ext_linear(GGMLRunnerContext* runner_ctx,
     if (scale != 1.f) {
         x = ggml_ext_scale(runner_ctx, x, scale);
     }
+    const auto mul_mat = [&](ggml_tensor* input) {
+#ifndef SD_USE_UPSTREAM_GGML
+        // The INT8 path accumulates in INT32 and rescales in FP32.
+        if (runner_ctx->requantize_to_i8 && w->type == GGML_TYPE_Q8_0 && input->type == GGML_TYPE_F32 &&
+            (sd_backend_is(runner_ctx->backend, "CUDA") ||
+             sd_backend_is(runner_ctx->backend, "ROCm") ||
+             sd_backend_is(runner_ctx->backend, "MUSA") ||
+             sd_backend_is(runner_ctx->backend, "Vulkan"))) {
+            constexpr int group = 256;
+            auto* quantized     = ggml_ext_quantize_i8_convrot(runner_ctx, input, group);
+            if (quantized && ggml_backend_supports_op(runner_ctx->backend, quantized)) {
+                // Make the conversion depend on the activation so decoded weights only live near their GEMM.
+                ggml_tensor* inputs[] = {w, quantized};
+                auto* converted       = ggml_ext_op_create(ctx, sd_ggml_requantize_q8_op(), inputs, 2, nullptr);
+                if (converted && ggml_backend_supports_op(runner_ctx->backend, converted)) {
+                    const int64_t k = w->ne[0], n = w->ne[1];
+                    auto* weight = ggml_view_2d(ctx, converted, k, n, k, 0);
+                    auto* scales = ggml_view_1d(ctx, converted, n * sizeof(float), k * n);
+                    // The output stores float scales after the dense INT8 matrix.
+                    scales->type  = GGML_TYPE_F32;
+                    scales->ne[0] = n;
+                    scales->nb[0] = sizeof(float);
+                    auto* result  = ggml_ext_mul_mat_i8_tensorwise(runner_ctx, weight, quantized, scales, nullptr, group);
+                    if (result && ggml_backend_supports_op(runner_ctx->backend, result))
+                        return result;
+                }
+            }
+        }
+#endif
+        auto* result = ggml_mul_mat(ctx, w, input);
+        if (force_prec_f32)
+            ggml_prec_set_acc(result, GGML_PREC_F32);
+        return result;
+    };
     if (x->ne[2] * x->ne[3] > 1024) {
         // workaround: avoid ggml cuda error
         int64_t ne2 = x->ne[2];
         int64_t ne3 = x->ne[3];
         x           = ggml_reshape_2d(ctx, x, x->ne[0], x->ne[1] * x->ne[2] * x->ne[3]);
-        x           = ggml_mul_mat(ctx, w, x);
-        if (force_prec_f32) {
-            ggml_prec_set_acc(x, GGML_PREC_F32);
-        }
-        x = ggml_reshape_4d(ctx, x, x->ne[0], x->ne[1] / ne2 / ne3, ne2, ne3);
+        x           = mul_mat(x);
+        x           = ggml_reshape_4d(ctx, x, x->ne[0], x->ne[1] / ne2 / ne3, ne2, ne3);
     } else {
-        x = ggml_mul_mat(ctx, w, x);
-        if (force_prec_f32) {
-            ggml_prec_set_acc(x, GGML_PREC_F32);
-        }
+        x = mul_mat(x);
     }
     if (scale != 1.f) {
         x = ggml_ext_scale(runner_ctx, x, 1.f / scale);
@@ -858,9 +886,11 @@ ggml_tensor* ggml_ext_mul_mat_i8_tensorwise(GGMLRunnerContext* runner_ctx,
                                             ggml_tensor* ws,
                                             ggml_tensor* bias,
                                             int group,
-                                            ggml_tensor* xs) {
+                                            ggml_tensor* xs,
+                                            ggml_tensor* codebook,
+                                            ggml_tensor* relative_scale) {
     auto ctx = runner_ctx->ggml_ctx;
-    if (!w || !x)
+    if (!w || !x || (codebook == nullptr) != (relative_scale == nullptr))
         return nullptr;
     const auto* logical = x;
     if (x->type == GGML_TYPE_I8 && !xs) {
@@ -870,7 +900,7 @@ ggml_tensor* ggml_ext_mul_mat_i8_tensorwise(GGMLRunnerContext* runner_ctx,
         logical = x->src[0];
     }
     SDI8Attributes attr    = {{logical->ne[1], logical->ne[2], logical->ne[3]}, group, logical != x ? SD_I8_PACKED : 0};
-    ggml_tensor* inputs[5] = {w, x};
+    ggml_tensor* inputs[7] = {w, x};
     int count              = 2;
     if (xs) {
         attr.flags |= SD_I8_INPUT_SCALE;
@@ -883,6 +913,11 @@ ggml_tensor* ggml_ext_mul_mat_i8_tensorwise(GGMLRunnerContext* runner_ctx,
     if (bias) {
         attr.flags |= SD_I8_BIAS;
         inputs[count++] = bias;
+    }
+    if (codebook) {
+        attr.flags |= SD_I8_WEIGHT_W4;
+        inputs[count++] = codebook;
+        inputs[count++] = relative_scale;
     }
     return ggml_ext_op_create(ctx, sd_ggml_i8_op(), inputs, count, &attr);
 }
@@ -900,39 +935,6 @@ ggml_tensor* ggml_ext_quantize_i8_convrot(GGMLRunnerContext* runner_ctx, ggml_te
         runner_ctx->int8_convrot_cache.emplace(key, result);
     }
     return result;
-}
-
-ggml_tensor* ggml_ext_mul_mat_w4_convrot(GGMLRunnerContext* runner_ctx,
-                                         ggml_tensor* w,
-                                         ggml_tensor* x,
-                                         ggml_tensor* ws,
-                                         ggml_tensor* sc,
-                                         ggml_tensor* sr,
-                                         ggml_tensor* bias,
-                                         SDW4Kind kind,
-                                         int group) {
-    auto ctx = runner_ctx->ggml_ctx;
-    if (!w || !x || group < 0 || (group && !sd_ggml_valid_convrot_group(group)))
-        return nullptr;
-    const int quant_group = group ? group : 1;
-    if (x->type == GGML_TYPE_F32)
-        x = ggml_ext_quantize_i8_convrot(runner_ctx, x, quant_group);
-    int packed_group;
-    if (!sd_ggml_convrot_describe(x, &packed_group) || packed_group != quant_group)
-        return nullptr;
-    const auto* logical    = x->src[0];
-    SDW4Attributes attr    = {{logical->ne[1], logical->ne[2], logical->ne[3]}, kind, bias ? 1 : 0};
-    ggml_tensor* inputs[6] = {w, x, ws};
-    int count              = 3;
-    if (kind == SDW4Kind::W4A8) {
-        inputs[count++] = sc;
-        inputs[count++] = sr;
-    } else if (sc || sr) {
-        return nullptr;
-    }
-    if (bias)
-        inputs[count++] = bias;
-    return ggml_ext_op_create(ctx, sd_ggml_w4_op(), inputs, count, &attr);
 }
 
 ggml_tensor* ggml_ext_sage_attn(GGMLRunnerContext* runner_ctx,
@@ -1170,18 +1172,32 @@ ggml_tensor* ggml_ext_linear_w4_convrot(GGMLRunnerContext* runner_ctx,
                                         ggml_tensor* x,
                                         ggml_tensor* w,
                                         ggml_tensor* ws,
-                                        ggml_tensor* sc,
-                                        ggml_tensor* sr,
                                         ggml_tensor* bias,
-                                        SDW4Kind kind,
                                         int group,
-                                        float scale) {
+                                        float scale,
+                                        ggml_tensor* codebook,
+                                        ggml_tensor* s_rel) {
     auto ctx = runner_ctx->ggml_ctx;
     x        = ggml_ext_prepare_i8_input(runner_ctx, x);
     if (scale != 1.f) {
         x = ggml_ext_scale(runner_ctx, x, scale);
     }
-    auto out = ggml_ext_mul_mat_w4_convrot(runner_ctx, w, x, ws, sc, sr, scale == 1.f ? bias : nullptr, kind, group);
+    group = group ? group : 1;
+    if (x->type == GGML_TYPE_F32) {
+        x = ggml_ext_quantize_i8_convrot(runner_ctx, x, group);
+    }
+    int packed_group;
+    GGML_ASSERT(sd_ggml_convrot_describe(x, &packed_group) && packed_group == group);
+    ggml_tensor* fused_bias = scale == 1.f ? bias : nullptr;
+    ggml_tensor* out;
+    if (codebook) {
+        out = ggml_ext_mul_mat_i8_tensorwise(runner_ctx, w, x, ws, fused_bias, group, nullptr, codebook, s_rel);
+    } else {
+        const auto* logical   = x->src[0];
+        SDW4Attributes attr   = {{logical->ne[1], logical->ne[2], logical->ne[3]}, fused_bias ? 1 : 0};
+        ggml_tensor* inputs[] = {w, x, ws, fused_bias};
+        out                   = ggml_ext_op_create(ctx, sd_ggml_w4_op(), inputs, fused_bias ? 4 : 3, &attr);
+    }
     GGML_ASSERT(out);
     if (scale != 1.f) {
         out = ggml_ext_scale(runner_ctx, out, 1.f / scale);

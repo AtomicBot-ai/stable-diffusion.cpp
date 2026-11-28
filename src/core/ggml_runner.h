@@ -23,6 +23,11 @@
 
 struct GGMLRunnerContext;
 
+struct AttentionProcessor {
+    virtual ~AttentionProcessor()                                                                                                              = default;
+    virtual ggml_tensor* apply(GGMLRunnerContext& ctx, const std::string& layer, ggml_tensor* query, ggml_tensor* output, int64_t heads) const = 0;
+};
+
 struct WeightAdapter {
     struct ForwardParams {
         enum class op_type_t {
@@ -74,7 +79,9 @@ struct GGMLRunnerContext {
     ggml_cgraph* graph                                               = nullptr;
     bool flash_attn_enabled                                          = false;
     bool sage_attn_enabled                                           = false;
+    bool requantize_to_i8                                            = false;
     float linear_scale                                               = 0.f;
+    float conv_scale                                                 = 0.f;
     float attn_scale                                                 = 0.f;
     bool conv2d_direct_enabled                                       = false;
     bool conv3d_direct_enabled                                       = false;
@@ -82,6 +89,7 @@ struct GGMLRunnerContext {
     bool circular_y_enabled                                          = false;
     ggml_tensor* ip_context                                          = nullptr;
     float ip_scale                                                   = 1.0f;
+    const AttentionProcessor* attn2_processor                        = nullptr;
     std::shared_ptr<WeightAdapter> weight_adapter                    = nullptr;
     std::vector<std::pair<ggml_tensor*, std::string>>* debug_tensors = nullptr;
     std::function<ggml_tensor*(const std::string&)> get_cache_tensor;
@@ -133,6 +141,7 @@ private:
     std::shared_ptr<sd::ExecutionEngine> execution_engine_;
     sd::ExecutionSession& execution_session_;
     ggml_status last_compute_status_ = GGML_STATUS_SUCCESS;
+    std::string device_memory_error_;
 
 protected:
     typedef std::function<ggml_cgraph*()> get_graph_cb_t;
@@ -161,7 +170,9 @@ protected:
 
     bool flash_attn_enabled    = false;
     bool sage_attn_enabled     = false;
+    bool requantize_to_i8      = false;
     float linear_scale         = 0.f;
+    float conv_scale           = 0.f;
     float attn_scale           = 0.f;
     bool conv2d_direct_enabled = false;
     bool conv3d_direct_enabled = false;
@@ -293,6 +304,8 @@ public:
                                              const std::function<bool()>& read_outputs = {});
 
     ggml_status last_compute_status() const { return last_compute_status_; }
+    const std::string& device_memory_error() const { return device_memory_error_; }
+    void clear_device_memory_error() { device_memory_error_.clear(); }
 
     void set_flash_attention_enabled(bool enabled) {
         flash_attn_enabled = enabled;
@@ -306,9 +319,14 @@ public:
         }
     }
 
-    void set_scale_overrides(float linear_scale, float attn_scale) {
+    void set_linear_i8_enabled(bool enabled) {
+        requantize_to_i8 = enabled;
+    }
+
+    void set_scale_overrides(float linear_scale, float attn_scale, float conv_scale = 0.f) {
         this->linear_scale = linear_scale;
         this->attn_scale   = attn_scale;
+        this->conv_scale   = conv_scale;
     }
 
     void set_conv2d_direct_enabled(bool enabled) {
